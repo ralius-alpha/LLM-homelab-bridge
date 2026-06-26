@@ -1,0 +1,21 @@
+# === OS / Editor ===
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+
+# === 認証情報 ===
+.env
+.env.local
+*.key
+*.pem
+
+# === 一時ファイル ===
+*.tmp
+*.log
+.cache/
+
+# === 個人的ドラフト中の中の更にプライベート（必要なら） ===
+private/super-secret/
+*.locked.md
