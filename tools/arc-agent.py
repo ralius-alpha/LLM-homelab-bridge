@@ -114,6 +114,7 @@ class Spinner:
 def get_default_agent_prompt():
     return r"""あなたはWindows PC上でコマンドとファイル編集を実行できる自律型CLIエージェントです。
 実行は [EXECUTE_COMMAND]...[/EXECUTE_COMMAND]、編集は [EDIT_FILE]...[/EDIT_FILE] を使う。
+ファイルを読むときは Get-Content ではなく [READ_FILE] / FILE: パス / [/READ_FILE] を使う（文字化けせず行番号付きで読める）。
 コード改造は全文書き換え禁止。必ず [EDIT_FILE] の SEARCH/REPLACE で一部だけ直すこと。
 1回の返答でアクションは1個だけ。[EDIT OK] が出たら成功なので同じ編集を繰り返さない。
 回答は日本語で。
@@ -286,7 +287,8 @@ def extract_actions(response_text):
 
     combined = re.compile(
         r"(\[EXECUTE_COMMAND\](?P<cmd>.*?)\[/EXECUTE_COMMAND\])"
-        r"|(\[EDIT_FILE\](?P<edit>.*?)\[/EDIT_FILE\])",
+        r"|(\[EDIT_FILE\](?P<edit>.*?)\[/EDIT_FILE\])"
+        r"|(\[READ_FILE\](?P<read>.*?)\[/READ_FILE\])",
         re.DOTALL
     )
 
@@ -315,6 +317,15 @@ def extract_actions(response_text):
                     "file": file_match.group(1).strip().strip("'\""),
                     "search": sr_match.group(1),
                     "replace": sr_match.group(2)
+                })
+
+        elif m.group("read") is not None:
+            block = m.group("read")
+            file_match = re.search(r"FILE:\s*(.+)", block)
+            if file_match:
+                actions.append({
+                    "type": "read",
+                    "file": file_match.group(1).strip().strip("'\"")
                 })
     return actions
 
@@ -436,6 +447,40 @@ def run_edit(edit, mode):
         msg = f"[EDIT ERROR] 書き込み失敗 {file_path}: {ex}"
         print(msg)
         return msg
+
+
+def run_read(read):
+    """ファイルをPythonがUTF-8で直接読み、行番号付きで返す（PowerShell経由の文字化けを回避）。"""
+    file_path = read["file"]
+    if not os.path.isabs(file_path):
+        file_path = os.path.join(WORK_DIR, file_path)
+    print(f"\n[READ REQUESTED] 対象: {file_path}")
+
+    if not os.path.exists(file_path):
+        msg = f"[READ ERROR] ファイルが存在しません: {file_path}"
+        print(msg)
+        return msg
+
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            content = f.read()
+    except UnicodeDecodeError:
+        try:
+            with open(file_path, "r", encoding="cp932", errors="replace") as f:
+                content = f.read()
+        except Exception as ex:
+            msg = f"[READ ERROR] 読み込み失敗 {file_path}: {ex}"
+            print(msg)
+            return msg
+    except Exception as ex:
+        msg = f"[READ ERROR] 読み込み失敗 {file_path}: {ex}"
+        print(msg)
+        return msg
+
+    lines = content.splitlines()
+    numbered = "\n".join(f"{i + 1}: {line}" for i, line in enumerate(lines))
+    print(f"[READ OK] {len(lines)}行を読み込みました。")
+    return f"[FILE CONTENT of {file_path} ({len(lines)}行)]\n{numbered}"
 
 
 # ==========================================
@@ -750,6 +795,12 @@ def start_interactive_chat(model_name: str, exec_mode: str,
                     feedback_parts.append(f"[SYSTEM COMMAND OUTPUT for '{act['content']}']\n{res}")
                 elif act["type"] == "edit":
                     res = run_edit(act, exec_mode)
+                    feedback_parts.append(res)
+                elif act["type"] == "read":
+                    res = run_read(act)
+                    MAX_FEEDBACK = 14000
+                    if len(res) > MAX_FEEDBACK:
+                        res = res[:MAX_FEEDBACK] + "\n...(長いため省略)"
                     feedback_parts.append(res)
 
             feedback = "\n\n".join(feedback_parts)
