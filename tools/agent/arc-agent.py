@@ -12,44 +12,30 @@ import urllib.request
 import urllib.error
 from datetime import datetime
 
+from scripts.config import (
+    OLLAMA_HOST,
+    KEEP_ALIVE,
+    MODELS,
+    EXEC_MODES,
+    IGNORE_FIELDS,
+    THINKING_FIELDS,
+    SPINNER_FRAMES,
+)
+
 # ==========================================
 # 1. 動作・環境設定 (Intel Arc A770 最適化)
 # ==========================================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 PROMPT_FILE = os.path.join(BASE_DIR, "prompt.txt")
-OLLAMA_HOST = "http://127.0.0.1:11434"
 
 # ★ AIが実行するコマンドの作業ディレクトリ（cdが引き継がれない問題への物理的対策）
 #   起動時にユーザーが設定する。未設定なら BASE_DIR を使う。
 WORK_DIR = BASE_DIR
 
-# ★ アイドル3分で自動的にVRAMから解放
-KEEP_ALIVE = "3m"
-
-MODELS = {
-    "1": ("DeepSeek-R1 : 7B", "deepseek-r1:7b"),
-    "2": ("DeepSeek-R1 : 14B", "deepseek-r1:14b"),
-    "3": ("DeepSeek-R1 : 32B", "deepseek-r1:32b"),
-    "4": ("DeepSeek-R1 : 1.5B", "deepseek-r1:1.5b"),
-    "5": ("DeepSeek-Coder-V2 : 16B (コード特化)", "deepseek-coder-v2:16b"),
-    "6": ("Qwen2.5-Coder : 14B (コード特化・推奨)", "qwen2.5-coder:14b"),
-    "7": ("Qwen2.5-Coder : 32B Q3 (最強・要VRAM)", "qwen2.5-coder:32b-instruct-q3_K_M")
-}
-
-EXEC_MODES = {
-    "safe": "Safe Auto (参照系は自動実行 / 変更・削除は要承認)",
-    "strict": "Strict (全コマンドで事前承認が必要)",
-    "full": "Full Auto (全コマンドを自動実行)"
-}
-
 CURRENT_MODE = "safe"
 
 _prev_len = [0]
 
-# message内で無視するノイズフィールド（毎チャンク付いてくるだけ）
-IGNORE_FIELDS = {"role"}
-# 思考としてカウント/表示する候補フィールド名
-THINKING_FIELDS = {"thinking", "reasoning", "reasoning_content"}
 
 # ==========================================
 # 点字スピナー（1秒で1周 = 10コマ×0.1秒）
