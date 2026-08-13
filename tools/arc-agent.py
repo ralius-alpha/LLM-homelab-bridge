@@ -8,6 +8,7 @@ import json
 import unicodedata
 import urllib.request
 import urllib.error
+from datetime import datetime
 
 # ==========================================
 # 1. 動作・環境設定 (Intel Arc A770 最適化)
@@ -119,7 +120,7 @@ def warmup_model(model_name):
         print(f"[WARN] モデルロード中にエラーが発生しましたが続行します: {e}")
 
 def extract_command(response_text):
-    """レスポンスからEXECUTE_COMMANDブロックを抽出（コメント除去・単一コマンド化）"""
+    """レスポンスからEXECUTE_COMMANDブロックを抽出"""
     pattern = r"\[EXECUTE_COMMAND\]\s*(.*?)\s*\[/EXECUTE_COMMAND\]"
     matches = re.findall(pattern, response_text, re.DOTALL)
     if matches:
@@ -135,7 +136,7 @@ def extract_command(response_text):
     return None
 
 def is_read_only_command(command: str) -> bool:
-    """コマンドが可逆（参照系/Read-Only）か不可逆（書き込み/削除/変更系）かを判定"""
+    """コマンドが可逆（参照系）か不可逆かを判定"""
     cmd = command.strip()
     
     # ファイル書き込みリダイレクト (>, >>) があれば不可逆と判定
@@ -175,7 +176,7 @@ def is_read_only_command(command: str) -> bool:
     return True
 
 def execute_system_command_passthrough(command: str, mode: str) -> str:
-    """【自作API】PowerShell上でコマンドを実行し、結果を返却（モード別承認制御）"""
+    """PowerShell上でコマンドを実行し、結果を返却"""
     read_only = is_read_only_command(command)
     op_type_str = "可逆(参照系)" if read_only else "不可逆(変更/削除系)"
     
@@ -224,12 +225,23 @@ def execute_system_command_passthrough(command: str, mode: str) -> str:
         print(f"[API ERROR] コマンドの実行に失敗しました: {e}")
         return f"[API ERROR] 実行失敗: {e}"
 
-def start_interactive_chat(model_name: str, exec_mode: str):
-    """対話セッション管理"""
+def start_interactive_chat(model_name: str, exec_mode: str, debug_mode: bool = False):
+    """対話セッション管理（debug_modeがTrueの場合、生データを全出力＆会話ログをファイルに記録）"""
     warmup_model(model_name)
     
+    # ログファイルの準備（デバッグモード用）
+    chat_log_file = None
+    if debug_mode:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        chat_log_file = os.path.join(BASE_DIR, f"debug_chat_log_{timestamp}.txt")
+        print(f"[DEBUG LOG] 会話ログ記録先: {chat_log_file}")
+        with open(chat_log_file, "w", encoding="utf-8") as f:
+            f.write(f"=== Debug Chat Log - Model: {model_name} - Time: {timestamp} ===\n\n")
+
     print(f"\n[CLIENT] {model_name} との対話セッションを開始します。")
     print(f"[MODE] 実行承認モード: {EXEC_MODES[exec_mode]}")
+    if debug_mode:
+        print("[MODE] ★デバッグモード有効（全生テキスト出力 ＆ ログ保存中）★")
     print("※ 終了するには 'exit' または 'quit' と入力してください。")
     print("※ 複数行入力対応です。送信するには新しい行で 'EOF' と入力するか、Ctrl+Z/Ctrl+Dを入力してください。\n")
     
@@ -257,6 +269,10 @@ def start_interactive_chat(model_name: str, exec_mode: str):
             
         messages.append({"role": "user", "content": user_input})
         
+        if chat_log_file:
+            with open(chat_log_file, "a", encoding="utf-8") as f:
+                f.write(f"\n[User Input]\n{user_input}\n")
+        
         while True:
             # VRAM超過を防ぐため num_ctx を制限し、アンロードを防ぐ keep_alive を指定
             payload = json.dumps({
@@ -276,10 +292,7 @@ def start_interactive_chat(model_name: str, exec_mode: str):
             )
             
             ai_response_full = ""
-            is_thinking = False
-            think_token_count = 0
-            
-            print("\n--- DeepSeek Response ---")
+            print("\n--- DeepSeek Response (Raw Stream) ---" if debug_mode else "\n--- DeepSeek Response ---")
             
             try:
                 with urllib.request.urlopen(req) as res:
@@ -291,27 +304,7 @@ def start_interactive_chat(model_name: str, exec_mode: str):
                         content = chunk.get("message", {}).get("content", "")
                         ai_response_full += content
                         
-                        # 思考プロセスの開始・終了の明示とタグの置換
-                        if "<think>" in content:
-                            is_thinking = True
-                            content = content.replace("<think>", "\n[思考プロセス開始]\n")
-                            
-                        if "</think>" in content:
-                            is_thinking = False
-                            content = content.replace("</think>", "\n[思考プロセス終了]\n")
-                        
-                        # トークンカウンタによる上書き処理を削除し、チャンクを常に標準出力へフラッシュ
-                        if content:
-                            print(content, end="", flush=True)# 思考プロセスの開始・終了の明示とタグの置換
-                        if "<think>" in content:
-                            is_thinking = True
-                            content = content.replace("<think>", "\n[思考プロセス開始]\n")
-                            
-                        if "</think>" in content:
-                            is_thinking = False
-                            content = content.replace("</think>", "\n[思考プロセス終了]\n")
-                        
-                        # トークンカウンタによる上書き処理を削除し、チャンクを常に標準出力へフラッシュ
+                        # デバッグモード時は一切の隠蔽や置換をせず、受け取ったチャンクをそのまま出力
                         if content:
                             print(content, end="", flush=True)
                                 
@@ -322,6 +315,10 @@ def start_interactive_chat(model_name: str, exec_mode: str):
             print()
             messages.append({"role": "assistant", "content": ai_response_full})
             
+            if chat_log_file:
+                with open(chat_log_file, "a", encoding="utf-8") as f:
+                    f.write(f"\n[AI Response]\n{ai_response_full}\n")
+            
             command_to_run = extract_command(ai_response_full)
             if command_to_run:
                 cmd_result = execute_system_command_passthrough(command_to_run, exec_mode)
@@ -329,6 +326,9 @@ def start_interactive_chat(model_name: str, exec_mode: str):
                     "role": "user",
                     "content": f"[SYSTEM COMMAND OUTPUT for '{command_to_run}']\n{cmd_result}"
                 })
+                if chat_log_file:
+                    with open(chat_log_file, "a", encoding="utf-8") as f:
+                        f.write(f"\n[System Command Output]\n{cmd_result}\n")
                 print("\n[SYSTEM] コマンド実行結果をAIにフィードバックして解析中...")
                 continue
             else:
@@ -369,6 +369,7 @@ def main():
         for key, (label, _) in MODELS.items():
             print(f" [{key}] {label}")
         print(" [m] 承認モード変更")
+        print(" [9] Debug Log & Raw Stream Mode (デバッグ用)")
         print(" [5] EXIT")
         print("===================================================")
         print(f" [Mode]     Current: {EXEC_MODES[CURRENT_MODE]}")
@@ -376,20 +377,37 @@ def main():
         print(f" [Prompt]   Loaded from '{PROMPT_FILE}'")
         print("===================================================")
         
-        raw_choice = input("メニュー番号を入力してください (1-5 / m): ")
+        raw_choice = input("メニュー番号を入力してください (1-5 / 9 / m): ")
         choice = unicodedata.normalize('NFKC', raw_choice).strip().lower()
         
         if choice in MODELS:
             server_proc = run_server(log_file)
             _, model_name = MODELS[choice]
             
-            start_interactive_chat(model_name, CURRENT_MODE)
+            start_interactive_chat(model_name, CURRENT_MODE, debug_mode=False)
             
             print("\n[INFO] セッションが終了しました。クリーンアップ中...")
             server_proc.terminate()
             server_proc.wait()
             cleanup_processes()
             input("\nメニューに戻るには何かキーを押してください...")
+        elif choice == "9":
+            # 9番: デバッグモード（モデル選択後にデバッグ用セッションへ移行）
+            print("\n--- デバッグモード用モデル選択 ---")
+            for key, (label, _) in MODELS.items():
+                print(f" [{key}] {label}")
+            sub_choice = input("モデル番号を選択してください (1-4): ").strip()
+            if sub_choice in MODELS:
+                server_proc = run_server(log_file)
+                _, model_name = MODELS[sub_choice]
+                
+                start_interactive_chat(model_name, CURRENT_MODE, debug_mode=True)
+                
+                print("\n[INFO] デバッグセッションが終了しました。クリーンアップ中...")
+                server_proc.terminate()
+                server_proc.wait()
+                cleanup_processes()
+                input("\nメニューに戻るには何かキーを押してください...")
         elif choice == "m":
             select_exec_mode()
         elif choice == "5":
