@@ -1,10 +1,12 @@
 import os
 import sys
 import time
+import threading
 import subprocess
 import shutil
 import re
 import json
+import base64
 import unicodedata
 import urllib.request
 import urllib.error
@@ -17,57 +19,202 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 PROMPT_FILE = os.path.join(BASE_DIR, "prompt.txt")
 OLLAMA_HOST = "http://127.0.0.1:11434"
 
+# ★ AIが実行するコマンドの作業ディレクトリ（cdが引き継がれない問題への物理的対策）
+#   起動時にユーザーが設定する。未設定なら BASE_DIR を使う。
+WORK_DIR = BASE_DIR
+
+# ★ アイドル3分で自動的にVRAMから解放
+KEEP_ALIVE = "3m"
+
 MODELS = {
     "1": ("DeepSeek-R1 : 7B", "deepseek-r1:7b"),
     "2": ("DeepSeek-R1 : 14B", "deepseek-r1:14b"),
     "3": ("DeepSeek-R1 : 32B", "deepseek-r1:32b"),
-    "4": ("DeepSeek-R1 : 1.5B", "deepseek-r1:1.5b")
+    "4": ("DeepSeek-R1 : 1.5B", "deepseek-r1:1.5b"),
+    "5": ("DeepSeek-Coder-V2 : 16B (コード特化)", "deepseek-coder-v2:16b"),
+    "6": ("Qwen2.5-Coder : 14B (コード特化・推奨)", "qwen2.5-coder:14b"),
+    "7": ("Qwen2.5-Coder : 32B Q3 (最強・要VRAM)", "qwen2.5-coder:32b-instruct-q3_K_M")
 }
 
-# 承認モード定義
 EXEC_MODES = {
     "safe": "Safe Auto (参照系は自動実行 / 変更・削除は要承認)",
     "strict": "Strict (全コマンドで事前承認が必要)",
     "full": "Full Auto (全コマンドを自動実行)"
 }
 
-CURRENT_MODE = "safe"  # デフォルトモード
+CURRENT_MODE = "safe"
+
+_prev_len = [0]
+
+# message内で無視するノイズフィールド（毎チャンク付いてくるだけ）
+IGNORE_FIELDS = {"role"}
+# 思考としてカウント/表示する候補フィールド名
+THINKING_FIELDS = {"thinking", "reasoning", "reasoning_content"}
+
+# ==========================================
+# 点字スピナー（1秒で1周 = 10コマ×0.1秒）
+# ==========================================
+SPINNER_FRAMES = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
+
+
+class Spinner:
+    """別スレッドで点字スピナーを回し、状態ラベル＋受信トークン数を表示する。1秒で1周。"""
+    def __init__(self):
+        self._stop = threading.Event()
+        self._thread = None
+        self._token_count = 0
+        self._label = "受信中"
+        self._active = False
+
+    def _run(self):
+        i = 0
+        while not self._stop.is_set():
+            frame = SPINNER_FRAMES[i % len(SPINNER_FRAMES)]
+            n = self._token_count
+            label = self._label
+            sys.stdout.write(f"\r{frame} {label}... {n} tokens      ")
+            sys.stdout.flush()
+            i += 1
+            time.sleep(0.1)
+
+    def start(self, label="受信中"):
+        self._stop.clear()
+        self._token_count = 0
+        self._label = label
+        self._active = True
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def set_label(self, label):
+        self._label = label
+
+    def add_token(self, n=1):
+        self._token_count += n
+
+    def get_count(self):
+        return self._token_count
+
+    def stop(self, clear_line=False):
+        if not self._active:
+            return self._token_count
+        self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=1)
+        self._active = False
+        final = self._token_count
+        if clear_line:
+            sys.stdout.write("\r" + " " * 50 + "\r")
+            sys.stdout.flush()
+        else:
+            sys.stdout.write(f"\r[DONE] 受信完了 {final} tokens              \n")
+            sys.stdout.flush()
+        return final
+
+
+def get_default_agent_prompt():
+    return r"""あなたはWindows PC上でコマンドとファイル編集を実行できる自律型CLIエージェントです。
+実行は [EXECUTE_COMMAND]...[/EXECUTE_COMMAND]、編集は [EDIT_FILE]...[/EDIT_FILE] を使う。
+コード改造は全文書き換え禁止。必ず [EDIT_FILE] の SEARCH/REPLACE で一部だけ直すこと。
+1回の返答でアクションは1個だけ。[EDIT OK] が出たら成功なので同じ編集を繰り返さない。
+回答は日本語で。
+"""
+
 
 def load_system_prompt():
-    """外部テキストファイルから初期プロンプトを読み込む"""
     if os.path.exists(PROMPT_FILE):
         with open(PROMPT_FILE, "r", encoding="utf-8") as f:
             return f.read().strip()
-    return "すべて日本語で回答してください。"
+    return get_default_agent_prompt()
+
 
 def setup_environment():
-    """Intel Arc A770 用の環境変数をシステムプロセスに適用"""
     os.environ["OLLAMA_DEBUG"] = "1"
     os.environ["OLLAMA_NUM_PARALLEL"] = "1"
-    
-    # Intel GPU高速化フラグ (Immediate Command Listsの有効化が最も重要)
     os.environ["SYCL_PI_LEVEL_ZERO_USE_IMMEDIATE_COMMANDLISTS"] = "1"
     os.environ["SYCL_CACHE_PERSISTENT"] = "1"
     os.environ["SYCL_ENABLE_DEFAULT_CONTEXTS"] = "1"
-    
-    # 注意: UHD 630が存在するため、A770が 1 になる可能性があります。
-    # 速度が出ない場合は "level_zero:1" に変更して検証してください。
     os.environ["ONEAPI_DEVICE_SELECTOR"] = "level_zero:0"
     os.environ["OLLAMA_GPU_OVERHEAD"] = "1024"
-    
+
     local_app_data = os.environ.get("LOCALAPPDATA", "")
     ollama_path = os.path.join(local_app_data, "Programs", "Ollama")
     if os.path.exists(ollama_path):
         os.environ["PATH"] = f"{ollama_path};{os.environ['PATH']}"
 
+
 def cleanup_processes():
-    """裏で固まっている古いOllamaプロセスを完全に掃除"""
+    """Ollamaプロセスを完全に掃除する。"""
     if shutil.which("taskkill"):
-        subprocess.run("taskkill /f /im ollama.exe", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run("taskkill /f /im ollama.exe", shell=True,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run("taskkill /f /im ollama_llama_server.exe", shell=True,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run("taskkill /f /im \"ollama app.exe\"", shell=True,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     time.sleep(1)
 
+
+def unload_all_models():
+    """ロード中のモデルを keep_alive:0 でVRAMから即座に降ろす。"""
+    try:
+        req = urllib.request.Request(f"{OLLAMA_HOST}/api/ps")
+        with urllib.request.urlopen(req, timeout=3) as res:
+            data = json.loads(res.read().decode("utf-8"))
+        loaded = data.get("models", [])
+        if not loaded:
+            return
+        for m in loaded:
+            name = m.get("name") or m.get("model")
+            if not name:
+                continue
+            print(f"[UNLOAD] モデルをVRAMから解放中: {name}")
+            payload = json.dumps({"model": name, "keep_alive": 0}).encode("utf-8")
+            r = urllib.request.Request(
+                f"{OLLAMA_HOST}/api/generate", data=payload,
+                headers={"Content-Type": "application/json"})
+            try:
+                with urllib.request.urlopen(r, timeout=10) as _:
+                    pass
+            except Exception:
+                pass
+        time.sleep(1)
+    except Exception:
+        # サーバーが既に落ちている等は無視
+        pass
+
+
+def startup_cleanup():
+    """起動時に、既に動いているOllamaサーバー/プロセスがあれば全部掃除する。"""
+    print("[STARTUP] 既存のOllamaプロセスを確認中...")
+    found = False
+
+    try:
+        with urllib.request.urlopen(OLLAMA_HOST, timeout=1) as res:
+            if res.status == 200:
+                found = True
+                print("[STARTUP] 既に起動中のOllamaサーバーを検出しました。")
+    except Exception:
+        pass
+
+    if shutil.which("tasklist"):
+        try:
+            result = subprocess.run("tasklist", shell=True,
+                                    capture_output=True, text=True)
+            if "ollama" in (result.stdout or "").lower():
+                found = True
+        except Exception:
+            pass
+
+    if found:
+        print("[STARTUP] 既存のOllamaプロセスを全て終了します...")
+        cleanup_processes()
+        time.sleep(1)
+        print("[STARTUP] クリーンアップ完了。")
+    else:
+        print("[STARTUP] 起動中のOllamaはありません。そのまま続行します。")
+
+
 def wait_for_server(timeout=20):
-    """サーバーの正常起動をヘルスチェックAPIで確認"""
     start_time = time.time()
     while time.time() - start_time < timeout:
         try:
@@ -79,90 +226,239 @@ def wait_for_server(timeout=20):
         time.sleep(0.5)
     return False
 
+
 def run_server(log_file):
-    """バックグラウンドでOllamaサーバーを起動"""
     print("[SERVER] サーバー起動中...")
     if os.path.exists(log_file):
-        try: os.remove(log_file)
-        except OSError: pass
-            
+        try:
+            os.remove(log_file)
+        except OSError:
+            pass
     f_log = open(log_file, "w", encoding="utf-8")
-    server_proc = subprocess.Popen(["ollama", "serve"], stdout=f_log, stderr=subprocess.STDOUT, text=True)
-    
+    server_proc = subprocess.Popen(["ollama", "serve"], stdout=f_log,
+                                   stderr=subprocess.STDOUT, text=True)
     if not wait_for_server():
-        print("[ERROR] サーバーの起動確認にタイムアウトしました。ログを確認してください。")
+        print("[ERROR] サーバーの起動確認にタイムアウトしました。")
     else:
         print("[SERVER] サーバー起動完了。")
     return server_proc
 
+
 def warmup_model(model_name):
-    """モデルのVRAMロードと初期プロンプトの解読を監視"""
     print("[INFO] 初期プロンプト注入中...")
     _ = load_system_prompt()
     time.sleep(0.5)
-
     print("[INFO] 初期プロンプト解読中（AI）...")
     try:
-        # VRAMからのモデル解放を防ぐため keep_alive を追加
-        payload = json.dumps({
-            "model": model_name,
-            "keep_alive": -1
-        }).encode("utf-8")
+        payload = json.dumps({"model": model_name, "keep_alive": KEEP_ALIVE}).encode("utf-8")
         req = urllib.request.Request(
-            f"{OLLAMA_HOST}/api/generate",
-            data=payload,
-            headers={"Content-Type": "application/json"}
-        )
-        with urllib.request.urlopen(req, timeout=120) as res:
+            f"{OLLAMA_HOST}/api/generate", data=payload,
+            headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=180) as res:
             pass
         print("[INFO] 解読完了。準備が整いました。")
     except Exception as e:
         print(f"[WARN] モデルロード中にエラーが発生しましたが続行します: {e}")
 
-def extract_command(response_text):
-    """レスポンスからEXECUTE_COMMANDブロックを抽出"""
-    pattern = r"\[EXECUTE_COMMAND\]\s*(.*?)\s*\[/EXECUTE_COMMAND\]"
-    matches = re.findall(pattern, response_text, re.DOTALL)
-    if matches:
-        for raw_cmd in matches:
+
+def strip_think_blocks(text: str) -> str:
+    cleaned = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL | re.IGNORECASE)
+    cleaned = re.sub(r"<think>.*", "", cleaned, flags=re.DOTALL | re.IGNORECASE)
+    cleaned = cleaned.replace("</think>", "")
+    return cleaned.strip()
+
+
+def clean_clixml_noise(text: str) -> str:
+    if not text:
+        return ""
+    text = re.sub(r"#<\s*CLIXML.*?</Objs>", "", text, flags=re.DOTALL | re.IGNORECASE)
+    text = re.sub(r"#<\s*CLIXML.*", "", text, flags=re.DOTALL | re.IGNORECASE)
+    text = re.sub(r"Preparing modules for first use\.?", "", text, flags=re.IGNORECASE)
+    return text.strip()
+
+
+# ==========================================
+# 2. アクション抽出
+# ==========================================
+def extract_actions(response_text):
+    target_text = strip_think_blocks(response_text)
+    actions = []
+
+    combined = re.compile(
+        r"(\[EXECUTE_COMMAND\](?P<cmd>.*?)\[/EXECUTE_COMMAND\])"
+        r"|(\[EDIT_FILE\](?P<edit>.*?)\[/EDIT_FILE\])",
+        re.DOTALL
+    )
+
+    for m in combined.finditer(target_text):
+        if m.group("cmd") is not None:
+            raw_cmd = m.group("cmd")
             clean_lines = [
-                line.strip() for line in raw_cmd.splitlines() 
+                line.strip() for line in raw_cmd.splitlines()
                 if line.strip() and not line.strip().startswith('#')
             ]
             if clean_lines:
-                sanitized_cmd = " ; ".join(clean_lines)
-                if "[EXECUTE_COMMAND]" not in sanitized_cmd:
-                    return sanitized_cmd
-    return None
+                sanitized = " ; ".join(clean_lines)
+                if "[EXECUTE_COMMAND]" not in sanitized:
+                    actions.append({"type": "command", "content": sanitized})
 
+        elif m.group("edit") is not None:
+            block = m.group("edit")
+            file_match = re.search(r"FILE:\s*(.+)", block)
+            sr_match = re.search(
+                r"<<<<<<<\s*SEARCH\s*\n(.*?)\n=======\s*\n(.*?)\n>>>>>>>\s*REPLACE",
+                block, re.DOTALL
+            )
+            if file_match and sr_match:
+                actions.append({
+                    "type": "edit",
+                    "file": file_match.group(1).strip().strip("'\""),
+                    "search": sr_match.group(1),
+                    "replace": sr_match.group(2)
+                })
+    return actions
+
+
+# ==========================================
+# 3. SEARCH/REPLACE の適用（曖昧マッチング付き）
+# ==========================================
+def _normalize_lines(text):
+    return [line.strip() for line in text.splitlines()]
+
+
+def apply_search_replace(file_content, search_block, replace_block):
+    if search_block in file_content:
+        return file_content.replace(search_block, replace_block, 1), "完全一致で置換しました。"
+
+    content_lines = file_content.splitlines()
+    search_lines = search_block.splitlines()
+    norm_search = _normalize_lines(search_block)
+    if not norm_search:
+        return None, "SEARCHが空です。"
+
+    match_indexes = []
+    for i in range(len(content_lines) - len(search_lines) + 1):
+        window = [content_lines[i + j].strip() for j in range(len(search_lines))]
+        if window == norm_search:
+            match_indexes.append(i)
+
+    if len(match_indexes) == 1:
+        i = match_indexes[0]
+        original_first = content_lines[i]
+        indent = original_first[:len(original_first) - len(original_first.lstrip())]
+        replace_lines = replace_block.splitlines()
+        adjusted = []
+        for idx, rl in enumerate(replace_lines):
+            if idx == 0 and rl and not rl.startswith((" ", "\t")):
+                adjusted.append(indent + rl)
+            else:
+                adjusted.append(rl)
+        new_lines = content_lines[:i] + adjusted + content_lines[i + len(search_lines):]
+        return "\n".join(new_lines), "曖昧一致（空白差異を吸収）で置換しました。"
+
+    if len(match_indexes) > 1:
+        lines_str = ", ".join(str(m + 1) for m in match_indexes)
+        return None, (f"SEARCHが複数箇所({lines_str}行目付近)に一致しました。"
+                      f"もっと前後の行を含めて一意にしてください。")
+
+    hint = _find_similar_hint(content_lines, norm_search)
+    return None, (f"SEARCHブロックが見つかりませんでした。{hint}"
+                  f"Get-Contentで読み直し、実在する行を正確にSEARCHに入れてください。")
+
+
+def _find_similar_hint(content_lines, norm_search):
+    if not norm_search:
+        return ""
+    target = norm_search[0]
+    if not target:
+        return ""
+    for idx, line in enumerate(content_lines):
+        if target in line.strip():
+            return (f"（ヒント: {idx + 1}行目に似た行 '{line.strip()[:60]}' があります。）")
+    return ""
+
+
+def run_edit(edit, mode):
+    file_path = edit["file"]
+    print(f"\n[EDIT REQUESTED] 対象: {file_path}")
+    print(f"  SEARCH({len(edit['search'].splitlines())}行) -> REPLACE({len(edit['replace'].splitlines())}行)")
+
+    # 編集は「不可逆(変更系)」操作。モードに応じて承認要否を決める。
+    op_type_str = "不可逆(変更/編集系)"
+    need_approval = False
+    if mode == "strict":
+        need_approval = True
+    elif mode == "safe":
+        need_approval = True
+    # full の場合は need_approval = False のまま（自動実行）
+
+    if need_approval:
+        raw = input(f"この {op_type_str} 編集を実行しますか？ (y/n / 拒否理由コメント): ").strip()
+        val = unicodedata.normalize('NFKC', raw).lower()
+
+        if val == 'y':
+            pass  # 実行へ
+        elif val == 'n' or val == '':
+            print("[API NOTICE] 実行が拒否されました。")
+            return "[SYSTEM NOTICE] ユーザーによってファイル編集が拒否されました。"
+        else:
+            # y/n 以外の文字列を入力した場合はコメント付き拒否として返す
+            print(f"[API NOTICE] 実行が拒否されました (コメント: {raw})")
+            return f"[SYSTEM NOTICE] ユーザーによってファイル編集が拒否されました。拒否理由/指示: {raw}"
+
+    if not os.path.exists(file_path):
+        msg = f"[EDIT ERROR] ファイルが存在しません: {file_path}（先にCopy-Item等で作成が必要）"
+        print(msg)
+        return msg
+
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            content = f.read()
+    except Exception as ex:
+        msg = f"[EDIT ERROR] 読み込み失敗 {file_path}: {ex}"
+        print(msg)
+        return msg
+
+    new_content, message = apply_search_replace(content, edit["search"], edit["replace"])
+    if new_content is None:
+        msg = f"[EDIT FAILED] {file_path}: {message}"
+        print(msg)
+        return msg
+
+    try:
+        shutil.copy2(file_path, file_path + ".bak")
+        with open(file_path, "w", encoding="utf-8") as f:
+            f.write(new_content)
+        msg = f"[EDIT OK] {file_path}: {message}（バックアップ: {os.path.basename(file_path)}.bak）"
+        print(msg)
+        return msg
+    except Exception as ex:
+        msg = f"[EDIT ERROR] 書き込み失敗 {file_path}: {ex}"
+        print(msg)
+        return msg
+
+
+# ==========================================
+# 4. コマンド安全判定 & 実行
+# ==========================================
 def is_read_only_command(command: str) -> bool:
-    """コマンドが可逆（参照系）か不可逆かを判定"""
     cmd = command.strip()
-    
-    # ファイル書き込みリダイレクト (>, >>) があれば不可逆と判定
     if re.search(r'>|>>', cmd):
         return False
-        
-    # 明示的な破壊・変更操作（PS動詞 / 固有コマンド）
     mutating_patterns = [
         r'\b(remove|set|new|add|rename|move|copy|clear|stop|restart|invoke|start|register|unregister)-',
         r'\b(rm|del|erase|mkdir|md|rmdir|rd|mv|cp|ren|write|out-file|set-content|add-content|clear-content)\b',
         r'\bgit\s+(commit|push|pull|checkout|merge|rebase|reset|clean|branch\s+-[dD])\b',
         r'\b(pip|npm|yarn|cargo|apt|winget|choco)\s+(install|uninstall|update|remove|build)\b'
     ]
-    
     for pattern in mutating_patterns:
         if re.search(pattern, cmd, re.IGNORECASE):
             return False
-            
-    # 可逆（参照・読み取り）操作パターン
     read_only_patterns = [
         r'^\s*(get|show|find|test|select|measure)-',
-        r'^\s*(dir|ls|cat|type|pwd|cd|tree|echo|Get-ChildItem|Get-Content|Get-Location|Select-String)\b',
+        r'^\s*(dir|ls|cat|type|pwd|cd|tree|echo|Get-ChildItem|Get-Content|Get-Location|Select-String|ForEach-Object)\b',
         r'^\s*git\s+(status|log|diff|show|branch)\b'
     ]
-    
-    # セミコロン分割されたサブコマンドを個別にチェック
     sub_commands = [c.strip() for c in cmd.split(';') if c.strip()]
     for sub in sub_commands:
         sub_is_ro = False
@@ -172,64 +468,168 @@ def is_read_only_command(command: str) -> bool:
                 break
         if not sub_is_ro:
             return False
-            
     return True
 
-def execute_system_command_passthrough(command: str, mode: str) -> str:
-    """PowerShell上でコマンドを実行し、結果を返却"""
+
+def run_command(command: str, mode: str) -> str:
     read_only = is_read_only_command(command)
     op_type_str = "可逆(参照系)" if read_only else "不可逆(変更/削除系)"
-    
-    print(f"\n[⚠️ API TRIGGERED] コマンド要求: {command}")
+    print(f"\n[API TRIGGERED] コマンド要求: {command}")
     print(f"[OP TYPE] 操作属性: {op_type_str}")
 
-    # 承認が必要かどうかの判定
     need_approval = False
     if mode == "strict":
         need_approval = True
     elif mode == "safe":
         need_approval = not read_only
-    elif mode == "full":
-        need_approval = False
 
     if need_approval:
-        raw_confirm = input(f"この {op_type_str} コマンドを実行しますか？ (y/n): ")
-        confirm = unicodedata.normalize('NFKC', raw_confirm).strip().lower()
-        if confirm != 'y':
-            print("[API NOTICE] ユーザーによってコマンドの実行が拒否されました。")
+        raw = input(f"この {op_type_str} コマンドを実行しますか？ (y/n): ")
+        if unicodedata.normalize('NFKC', raw).strip().lower() != 'y':
+            print("[API NOTICE] 実行が拒否されました。")
             return "[SYSTEM NOTICE] ユーザーによってコマンドの実行が拒否されました。"
 
     print(f"[RUNNING] -> {command}")
     try:
-        escaped_cmd = command.replace('"', '\"')
-        ps_command = f'powershell -NoProfile -ExecutionPolicy Bypass -Command "{escaped_cmd}"'
-        result = subprocess.run(ps_command, shell=True, capture_output=True)
-        
+        wrapped = "$ProgressPreference='SilentlyContinue'; " + command
+        encoded = base64.b64encode(wrapped.encode("utf-16-le")).decode("ascii")
+        ps_command = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+                      "-EncodedCommand", encoded]
+        result = subprocess.run(ps_command, capture_output=True, cwd=WORK_DIR)
         try:
             stdout = result.stdout.decode('utf-8')
             stderr = result.stderr.decode('utf-8')
         except UnicodeDecodeError:
             stdout = result.stdout.decode('cp932', errors='replace')
             stderr = result.stderr.decode('cp932', errors='replace')
-            
+        stderr = clean_clixml_noise(stderr)
+
         print("--- [COMMAND OUTPUT] ---")
-        if stdout: print(stdout, end="")
-        if stderr: print(f"Error Output: {stderr}", end="")
+        if stdout:
+            print(stdout, end="")
+        if stderr:
+            print(f"Error Output: {stderr}", end="")
         print("\n------------------------")
 
         output = ""
-        if stdout: output += stdout
-        if stderr: output += f"\n[Error Output]\n{stderr}"
-        return output if output else "(実行結果: 出力なし)"
+        if stdout:
+            output += stdout
+        if stderr.strip():
+            output += f"\n[Error Output]\n{stderr}"
+        return output if output.strip() else "(実行結果: 出力なし。正常終了)"
     except Exception as e:
-        print(f"[API ERROR] コマンドの実行に失敗しました: {e}")
+        print(f"[API ERROR] {e}")
         return f"[API ERROR] 実行失敗: {e}"
 
-def start_interactive_chat(model_name: str, exec_mode: str, debug_mode: bool = False):
-    """対話セッション管理（debug_modeがTrueの場合、生データを全出力＆会話ログをファイルに記録）"""
+
+# ==========================================
+# 5. ストリーム表示
+# ==========================================
+def stream_chat_response(req, debug_mode: bool, raw_dump: bool = False):
+    """通常/ログ: スピナー(点字/1秒1周)＋思考(thinking)と本文(content)のトークンを数える。
+                 思考中は『思考中』、本文中は『出力中』とラベルを切り替える。
+       raw_dump=True: role等のノイズを無視し、フィールドが変わったらヘッダを出して都度出力。"""
+    ai_response_full = ""
+
+    # ---------- 生ダンプモード ----------
+    if raw_dump:
+        chunk_index = 0
+        current_field = None
+        field_char_counts = {}
+
+        with urllib.request.urlopen(req) as res:
+            for line in res:
+                if not line:
+                    continue
+                chunk = json.loads(line.decode("utf-8"))
+                msg_obj = chunk.get("message", {})
+                chunk_index += 1
+
+                for field_name, value in msg_obj.items():
+                    if field_name in IGNORE_FIELDS:
+                        continue
+                    if not isinstance(value, str) or value == "":
+                        continue
+
+                    if field_name != current_field:
+                        if current_field is not None:
+                            print()
+                        print(f"\n------ [{field_name}] ------")
+                        current_field = field_name
+
+                    print(value, end="", flush=True)
+
+                    field_char_counts[field_name] = field_char_counts.get(field_name, 0) + len(value)
+                    if field_name == "content":
+                        ai_response_full += value
+
+        print()
+        print("========== DUMP SUMMARY ==========")
+        print(f"[SUMMARY] 総チャンク数: {chunk_index}")
+        if field_char_counts:
+            for fname, cnt in field_char_counts.items():
+                print(f"[SUMMARY] フィールド '{fname}' の総文字数: {cnt}")
+        else:
+            print("[SUMMARY] 中身のあるフィールドはありませんでした。")
+        print("==================================")
+        return ai_response_full
+
+    # ---------- 通常 / ログモード ----------
+    spinner = Spinner()
+    spinner.start(label="思考中")
+
+    content_started = False
+
+    try:
+        with urllib.request.urlopen(req) as res:
+            for line in res:
+                if not line:
+                    continue
+                chunk = json.loads(line.decode("utf-8"))
+                msg_obj = chunk.get("message", {})
+
+                content = msg_obj.get("content", "")
+                thinking = ""
+                for k, v in msg_obj.items():
+                    if k in IGNORE_FIELDS:
+                        continue
+                    if k in THINKING_FIELDS and isinstance(v, str):
+                        thinking += v
+
+                if thinking:
+                    spinner.add_token(1)
+                    if not content_started:
+                        spinner.set_label("思考中")
+
+                if content:
+                    ai_response_full += content
+                    spinner.add_token(1)
+                    if not content_started:
+                        content_started = True
+                        spinner.set_label("出力中")
+
+                if not content and not thinking:
+                    continue
+    finally:
+        spinner.stop(clear_line=False)
+
+    visible = strip_think_blocks(ai_response_full)
+    if debug_mode:
+        print(visible if visible else ai_response_full)
+    else:
+        if visible:
+            print(visible)
+
+    return ai_response_full
+
+
+# ==========================================
+# 6. 対話セッション（物理防御入り）
+# ==========================================
+def start_interactive_chat(model_name: str, exec_mode: str,
+                           debug_mode: bool = False, raw_dump: bool = False):
     warmup_model(model_name)
-    
-    # ログファイルの準備（デバッグモード用）
+
     chat_log_file = None
     if debug_mode:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -240,14 +640,20 @@ def start_interactive_chat(model_name: str, exec_mode: str, debug_mode: bool = F
 
     print(f"\n[CLIENT] {model_name} との対話セッションを開始します。")
     print(f"[MODE] 実行承認モード: {EXEC_MODES[exec_mode]}")
-    if debug_mode:
-        print("[MODE] ★デバッグモード有効（全生テキスト出力 ＆ ログ保存中）★")
-    print("※ 終了するには 'exit' または 'quit' と入力してください。")
-    print("※ 複数行入力対応です。送信するには新しい行で 'EOF' と入力するか、Ctrl+Z/Ctrl+Dを入力してください。\n")
-    
+    print(f"[WORK_DIR] コマンド実行ディレクトリ: {WORK_DIR}")
+    print(f"[KEEP_ALIVE] アイドル {KEEP_ALIVE} で自動的にVRAMを解放します。")
+    if raw_dump:
+        print("[MODE] 生ダンプモード有効（フィールド切り替え式・都度出力）")
+    elif debug_mode:
+        print("[MODE] ログモード有効（生ストリーム＋会話ファイル保存）")
+    print("※ 終了: 'exit'/'quit' / 送信: 新しい行で 'EOF' か Ctrl+Z/Ctrl+D\n")
+
     messages = [{"role": "system", "content": load_system_prompt()}]
     print("[AI] 初期化が完了しました。質問をどうぞ。")
-    
+
+    MAX_AUTO_STEPS = 12
+    MAX_SAME_ACTION = 2
+
     while True:
         try:
             print("\n[Input] ---------------------------------")
@@ -262,90 +668,138 @@ def start_interactive_chat(model_name: str, exec_mode: str, debug_mode: bool = F
         except (EOFError, KeyboardInterrupt):
             print("\n[INFO] 対話を終了します。")
             return
-            
+
         user_input = "\n".join(lines).strip()
         if not user_input:
             continue
-            
+
         messages.append({"role": "user", "content": user_input})
-        
         if chat_log_file:
             with open(chat_log_file, "a", encoding="utf-8") as f:
                 f.write(f"\n[User Input]\n{user_input}\n")
-        
+
+        auto_steps = 0
+        last_action_signature = None
+        same_action_count = 0
+
         while True:
-            # VRAM超過を防ぐため num_ctx を制限し、アンロードを防ぐ keep_alive を指定
             payload = json.dumps({
                 "model": model_name,
                 "messages": messages,
                 "stream": True,
-                "keep_alive": -1,
+                "keep_alive": KEEP_ALIVE,
                 "options": {
-                    "num_ctx": 4096
+                    "num_ctx": 8192,
+                    "temperature": 0.2,
+                    "top_p": 0.9,
+                    "repeat_penalty": 1.15
                 }
             }).encode("utf-8")
-            
+
             req = urllib.request.Request(
-                f"{OLLAMA_HOST}/api/chat",
-                data=payload,
-                headers={"Content-Type": "application/json"}
-            )
-            
-            ai_response_full = ""
-            print("\n--- DeepSeek Response (Raw Stream) ---" if debug_mode else "\n--- DeepSeek Response ---")
-            
+                f"{OLLAMA_HOST}/api/chat", data=payload,
+                headers={"Content-Type": "application/json"})
+
+            print("\n--- Response ---")
+
             try:
-                with urllib.request.urlopen(req) as res:
-                    for line in res:
-                        if not line:
-                            continue
-                        
-                        chunk = json.loads(line.decode("utf-8"))
-                        content = chunk.get("message", {}).get("content", "")
-                        ai_response_full += content
-                        
-                        # デバッグモード時は一切の隠蔽や置換をせず、受け取ったチャンクをそのまま出力
-                        if content:
-                            print(content, end="", flush=True)
-                                
+                ai_response_full = stream_chat_response(req, debug_mode, raw_dump)
             except urllib.error.URLError as e:
                 print(f"\n[ERROR] 通信エラー: {e}")
                 return
 
             print()
             messages.append({"role": "assistant", "content": ai_response_full})
-            
             if chat_log_file:
                 with open(chat_log_file, "a", encoding="utf-8") as f:
                     f.write(f"\n[AI Response]\n{ai_response_full}\n")
-            
-            command_to_run = extract_command(ai_response_full)
-            if command_to_run:
-                cmd_result = execute_system_command_passthrough(command_to_run, exec_mode)
-                messages.append({
-                    "role": "user",
-                    "content": f"[SYSTEM COMMAND OUTPUT for '{command_to_run}']\n{cmd_result}"
-                })
-                if chat_log_file:
-                    with open(chat_log_file, "a", encoding="utf-8") as f:
-                        f.write(f"\n[System Command Output]\n{cmd_result}\n")
-                print("\n[SYSTEM] コマンド実行結果をAIにフィードバックして解析中...")
-                continue
-            else:
+
+            actions = extract_actions(ai_response_full)
+
+            if not actions:
                 break
 
+            actions = actions[:1]
+
+            # 物理防御1: 同一アクション連続検知
+            current_signature = json.dumps(actions[0], sort_keys=True, ensure_ascii=False)
+            if current_signature == last_action_signature:
+                same_action_count += 1
+            else:
+                same_action_count = 0
+            last_action_signature = current_signature
+
+            if same_action_count >= MAX_SAME_ACTION:
+                print(f"\n[SYSTEM] 物理防御作動: 同一アクションが{MAX_SAME_ACTION + 1}回連続。強制停止します。")
+                messages.append({
+                    "role": "user",
+                    "content": "[SYSTEM NOTICE] 同じアクションが繰り返し検出されました。"
+                               "その操作は既に成功済みです。これ以上アクションを出さず、"
+                               "行った変更内容を日本語で簡潔に報告して終了してください。"
+                })
+                _final_report(messages, model_name, debug_mode, chat_log_file)
+                break
+
+            feedback_parts = []
+            for act in actions:
+                if act["type"] == "command":
+                    res = run_command(act["content"], exec_mode)
+                    MAX_FEEDBACK = 14000
+                    if len(res) > MAX_FEEDBACK:
+                        res = res[:MAX_FEEDBACK] + "\n...(長いため省略)"
+                    feedback_parts.append(f"[SYSTEM COMMAND OUTPUT for '{act['content']}']\n{res}")
+                elif act["type"] == "edit":
+                    res = run_edit(act, exec_mode)
+                    feedback_parts.append(res)
+
+            feedback = "\n\n".join(feedback_parts)
+            messages.append({"role": "user", "content": feedback})
+            if chat_log_file:
+                with open(chat_log_file, "a", encoding="utf-8") as f:
+                    f.write(f"\n[Action Results]\n{feedback}\n")
+
+            # 物理防御2: 自動継続の絶対上限
+            auto_steps += 1
+            if auto_steps >= MAX_AUTO_STEPS:
+                print(f"\n[SYSTEM] 物理防御作動: 自動実行が上限({MAX_AUTO_STEPS}回)到達。強制停止します。")
+                break
+
+            print("\n[SYSTEM] 実行結果をAIにフィードバックして解析中...")
+            continue
+
+
+def _final_report(messages, model_name, debug_mode, chat_log_file):
+    """暴走停止後、最終報告を1回だけ生成させる（アクションは実行しない）"""
+    payload = json.dumps({
+        "model": model_name,
+        "messages": messages,
+        "stream": True,
+        "keep_alive": KEEP_ALIVE,
+        "options": {"num_ctx": 16384, "temperature": 0.3}
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        f"{OLLAMA_HOST}/api/chat", data=payload,
+        headers={"Content-Type": "application/json"})
+    print("\n--- 最終報告 ---")
+    try:
+        report = stream_chat_response(req, debug_mode, raw_dump=False)
+        print()
+        if chat_log_file:
+            with open(chat_log_file, "a", encoding="utf-8") as f:
+                f.write(f"\n[Final Report]\n{report}\n")
+    except urllib.error.URLError as e:
+        print(f"\n[ERROR] 最終報告の生成に失敗: {e}")
+
+
 def select_exec_mode() -> str:
-    """承認モード選択画面"""
     global CURRENT_MODE
     os.system("cls" if os.name == "nt" else "clear")
     print("===================================================")
-    print(" 承認モードの変更 (Execution Approval Mode)")
+    print(" 承認モードの変更")
     print("===================================================")
-    print(" [1] Safe Auto (推奨: 参照系は自動実行 / 変更・削除は事前承認)")
-    print(" [2] Strict    (全コマンド実行時に事前承認が必要)")
-    print(" [3] Full Auto (危険: 全コマンドを無確認で自動実行)")
+    print(" [1] Safe Auto   [2] Strict   [3] Full Auto")
     print("===================================================")
-    choice = input("モード番号を選択してください (1-3): ").strip()
+    choice = input("モード番号 (1-3): ").strip()
     if choice == "1":
         CURRENT_MODE = "safe"
     elif choice == "2":
@@ -354,66 +808,136 @@ def select_exec_mode() -> str:
         CURRENT_MODE = "full"
     return CURRENT_MODE
 
+
+def select_work_dir():
+    """作業ディレクトリを変更する。"""
+    global WORK_DIR
+    os.system("cls" if os.name == "nt" else "clear")
+    print("===================================================")
+    print(" 作業ディレクトリの変更")
+    print("===================================================")
+    print(f" 現在: {WORK_DIR}")
+    print(" AIが実行する全コマンドは、このディレクトリで動きます。")
+    print("===================================================")
+    raw_wd = input(" 新しいパス (空Enterで変更なし): ").strip().strip('"').strip("'")
+    if raw_wd:
+        if os.path.isdir(raw_wd):
+            WORK_DIR = os.path.abspath(raw_wd)
+            print(f" [OK] 作業ディレクトリを設定しました: {WORK_DIR}")
+        else:
+            print(f" [WARN] 指定パスが存在しません。変更しません: {WORK_DIR}")
+    time.sleep(1)
+    return WORK_DIR
+
+
+def _shutdown_session(server_proc):
+    """セッション終了時: VRAM解放 → サーバー停止 → プロセス掃除"""
+    print("\n[INFO] セッション終了。VRAM解放中...")
+    unload_all_models()
+    try:
+        server_proc.terminate()
+        server_proc.wait(timeout=5)
+    except Exception:
+        pass
+    cleanup_processes()
+
+
+def _select_model_and_run(exec_mode, log_file, debug_mode, raw_dump, header):
+    """モデル選択→セッション起動の共通処理"""
+    print(f"\n--- {header} ---")
+    for key, (label, _) in MODELS.items():
+        print(f" [{key}] {label}")
+    sub_choice = input("モデル番号を選択してください (1-7): ").strip()
+    sub_choice = unicodedata.normalize('NFKC', sub_choice).strip()
+    if sub_choice not in MODELS:
+        print("[INFO] 無効な選択です。メニューに戻ります。")
+        return
+    server_proc = run_server(log_file)
+    _, model_name = MODELS[sub_choice]
+    start_interactive_chat(model_name, exec_mode, debug_mode=debug_mode, raw_dump=raw_dump)
+    _shutdown_session(server_proc)
+    input("\nメニューに戻るには何かキーを押してください...")
+
+
 def main():
-    global CURRENT_MODE
+    global CURRENT_MODE, WORK_DIR
     log_file = os.path.join(BASE_DIR, "ollama_server.log")
     setup_environment()
-    
+
+    # ★ 作業ディレクトリの初期設定（AIコマンドはここで実行される）
+    print("===================================================")
+    print(" 作業ディレクトリの設定")
+    print("===================================================")
+    print(f" 現在の既定: {WORK_DIR}")
+    print(" AIが実行する全コマンドは、このディレクトリで動きます。")
+    print(" （Gitリポジトリ等の対象フォルダを指定してください）")
+    raw_wd = input(" 作業ディレクトリのパス (空Enterで既定のまま): ").strip().strip('"').strip("'")
+    if raw_wd:
+        if os.path.isdir(raw_wd):
+            WORK_DIR = os.path.abspath(raw_wd)
+            print(f" [OK] 作業ディレクトリを設定しました: {WORK_DIR}")
+        else:
+            print(f" [WARN] 指定パスが存在しません。既定のまま使用します: {WORK_DIR}")
+    time.sleep(1)
+
+    # 起動時: 既に動いているOllamaを全部掃除する
+    startup_cleanup()
+
     while True:
         cleanup_processes()
         os.system("cls" if os.name == "nt" else "clear")
-        
         print("===================================================")
         print("   Official Ollama - Intel Arc A770 Agent UI")
         print("===================================================")
         for key, (label, _) in MODELS.items():
             print(f" [{key}] {label}")
-        print(" [m] 承認モード変更")
-        print(" [9] Debug Log & Raw Stream Mode (デバッグ用)")
-        print(" [5] EXIT")
+        print("---------------------------------------------------")
+        print(" [m] 承認モードの変更")
+        print(" [w] 作業ディレクトリの変更")
+        print(" [l] ログモード (会話をファイル保存＋生ストリーム表示)")
+        print(" [d] 生ダンプモード (フィールド切り替え式・都度出力)")
+        print(" [0] 終了")
         print("===================================================")
-        print(f" [Mode]     Current: {EXEC_MODES[CURRENT_MODE]}")
-        print(f" [Log Path] {log_file}")
-        print(f" [Prompt]   Loaded from '{PROMPT_FILE}'")
+        print(f" [Mode]      Current: {EXEC_MODES[CURRENT_MODE]}")
+        print(f" [WorkDir]   {WORK_DIR}")
+        print(f" [KeepAlive] アイドル {KEEP_ALIVE} で自動解放")
+        print(f" [Log Path]  {log_file}")
+        print(f" [Prompt]    Loaded from '{PROMPT_FILE}'")
         print("===================================================")
-        
-        raw_choice = input("メニュー番号を入力してください (1-5 / 9 / m): ")
+
+        raw_choice = input("メニュー番号を入力 (1-7 / m / w / l / d / 0=終了): ")
         choice = unicodedata.normalize('NFKC', raw_choice).strip().lower()
-        
+
         if choice in MODELS:
             server_proc = run_server(log_file)
             _, model_name = MODELS[choice]
-            
-            start_interactive_chat(model_name, CURRENT_MODE, debug_mode=False)
-            
-            print("\n[INFO] セッションが終了しました。クリーンアップ中...")
-            server_proc.terminate()
-            server_proc.wait()
-            cleanup_processes()
+            start_interactive_chat(model_name, CURRENT_MODE, debug_mode=False, raw_dump=False)
+            _shutdown_session(server_proc)
             input("\nメニューに戻るには何かキーを押してください...")
-        elif choice == "9":
-            # 9番: デバッグモード（モデル選択後にデバッグ用セッションへ移行）
-            print("\n--- デバッグモード用モデル選択 ---")
-            for key, (label, _) in MODELS.items():
-                print(f" [{key}] {label}")
-            sub_choice = input("モデル番号を選択してください (1-4): ").strip()
-            if sub_choice in MODELS:
-                server_proc = run_server(log_file)
-                _, model_name = MODELS[sub_choice]
-                
-                start_interactive_chat(model_name, CURRENT_MODE, debug_mode=True)
-                
-                print("\n[INFO] デバッグセッションが終了しました。クリーンアップ中...")
-                server_proc.terminate()
-                server_proc.wait()
-                cleanup_processes()
-                input("\nメニューに戻るには何かキーを押してください...")
+
         elif choice == "m":
             select_exec_mode()
-        elif choice == "5":
+
+        elif choice == "w":
+            select_work_dir()
+
+        elif choice == "l":
+            _select_model_and_run(CURRENT_MODE, log_file,
+                                  debug_mode=True, raw_dump=False,
+                                  header="ログモード用モデル選択")
+
+        elif choice == "d":
+            _select_model_and_run(CURRENT_MODE, log_file,
+                                  debug_mode=True, raw_dump=True,
+                                  header="生ダンプモード用モデル選択")
+
+        elif choice == "0":
+            # ★ 終了時: VRAM解放してから全プロセスを掃除
+            unload_all_models()
             cleanup_processes()
             print("[INFO] 終了しました。")
             break
+
 
 if __name__ == "__main__":
     main()
