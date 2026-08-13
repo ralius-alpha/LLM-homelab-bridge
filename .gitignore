@@ -19,3 +19,13 @@ Thumbs.db
 # === 個人的ドラフト中の中の更にプライベート（必要なら） ===
 private/super-secret/
 *.locked.md
+
+# Python キャッシュ
+__pycache__/
+*.pyc
+*.pyo
+
+# エージェント実行時の生成物
+ollama_server.log
+debug_chat_log_*.txt
+*.bak
