@@ -43,8 +43,14 @@ def setup_environment():
     """Intel Arc A770 用の環境変数をシステムプロセスに適用"""
     os.environ["OLLAMA_DEBUG"] = "1"
     os.environ["OLLAMA_NUM_PARALLEL"] = "1"
-    os.environ["OLLAMA_INTEL_GPU"] = "true"
+    
+    # Intel GPU高速化フラグ (Immediate Command Listsの有効化が最も重要)
+    os.environ["SYCL_PI_LEVEL_ZERO_USE_IMMEDIATE_COMMANDLISTS"] = "1"
+    os.environ["SYCL_CACHE_PERSISTENT"] = "1"
     os.environ["SYCL_ENABLE_DEFAULT_CONTEXTS"] = "1"
+    
+    # 注意: UHD 630が存在するため、A770が 1 になる可能性があります。
+    # 速度が出ない場合は "level_zero:1" に変更して検証してください。
     os.environ["ONEAPI_DEVICE_SELECTOR"] = "level_zero:0"
     os.environ["OLLAMA_GPU_OVERHEAD"] = "1024"
     
@@ -96,7 +102,11 @@ def warmup_model(model_name):
 
     print("[INFO] 初期プロンプト解読中（AI）...")
     try:
-        payload = json.dumps({"model": model_name}).encode("utf-8")
+        # VRAMからのモデル解放を防ぐため keep_alive を追加
+        payload = json.dumps({
+            "model": model_name,
+            "keep_alive": -1
+        }).encode("utf-8")
         req = urllib.request.Request(
             f"{OLLAMA_HOST}/api/generate",
             data=payload,
@@ -125,9 +135,7 @@ def extract_command(response_text):
     return None
 
 def is_read_only_command(command: str) -> bool:
-    """
-    コマンドが可逆（参照系/Read-Only）か不可逆（書き込み/削除/変更系）かを判定
-    """
+    """コマンドが可逆（参照系/Read-Only）か不可逆（書き込み/削除/変更系）かを判定"""
     cmd = command.strip()
     
     # ファイル書き込みリダイレクト (>, >>) があれば不可逆と判定
@@ -217,7 +225,7 @@ def execute_system_command_passthrough(command: str, mode: str) -> str:
         return f"[API ERROR] 実行失敗: {e}"
 
 def start_interactive_chat(model_name: str, exec_mode: str):
-    """対話セッション管理」"""
+    """対話セッション管理"""
     warmup_model(model_name)
     
     print(f"\n[CLIENT] {model_name} との対話セッションを開始します。")
@@ -250,10 +258,15 @@ def start_interactive_chat(model_name: str, exec_mode: str):
         messages.append({"role": "user", "content": user_input})
         
         while True:
+            # VRAM超過を防ぐため num_ctx を制限し、アンロードを防ぐ keep_alive を指定
             payload = json.dumps({
                 "model": model_name,
                 "messages": messages,
-                "stream": True
+                "stream": True,
+                "keep_alive": -1,
+                "options": {
+                    "num_ctx": 4096
+                }
             }).encode("utf-8")
             
             req = urllib.request.Request(
@@ -278,22 +291,29 @@ def start_interactive_chat(model_name: str, exec_mode: str):
                         content = chunk.get("message", {}).get("content", "")
                         ai_response_full += content
                         
+                        # 思考プロセスの開始・終了の明示とタグの置換
                         if "<think>" in content:
                             is_thinking = True
-                            content = content.replace("<think>", "")
+                            content = content.replace("<think>", "\n[思考プロセス開始]\n")
                             
                         if "</think>" in content:
                             is_thinking = False
-                            think_token_count += len(content.replace("</think>", ""))
-                            print(f"\r[AI思考完了: {think_token_count} トークン]                  \n", end="")
-                            content = content.replace("</think>", "")
+                            content = content.replace("</think>", "\n[思考プロセス終了]\n")
                         
-                        if is_thinking:
-                            think_token_count += len(content)
-                            print(f"\r[AI思考中: {think_token_count} トークン]", end="", flush=True)
-                        else:
-                            if content:
-                                print(content, end="", flush=True)
+                        # トークンカウンタによる上書き処理を削除し、チャンクを常に標準出力へフラッシュ
+                        if content:
+                            print(content, end="", flush=True)# 思考プロセスの開始・終了の明示とタグの置換
+                        if "<think>" in content:
+                            is_thinking = True
+                            content = content.replace("<think>", "\n[思考プロセス開始]\n")
+                            
+                        if "</think>" in content:
+                            is_thinking = False
+                            content = content.replace("</think>", "\n[思考プロセス終了]\n")
+                        
+                        # トークンカウンタによる上書き処理を削除し、チャンクを常に標準出力へフラッシュ
+                        if content:
+                            print(content, end="", flush=True)
                                 
             except urllib.error.URLError as e:
                 print(f"\n[ERROR] 通信エラー: {e}")
