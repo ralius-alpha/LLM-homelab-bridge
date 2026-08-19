@@ -137,6 +137,29 @@ READ_FILE_TOOL = {
     },
 }
 
+SEARCH_WEB_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "search_web",
+        "description": (
+            "インターネットを検索し、上位の結果（タイトル・URL・要約）を返す。"
+            "PC上のファイルには無い最新情報や、一般的な知識・仕様を調べたい時に使う。"
+            "副作用は無い（何も変更しない）。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "検索キーワード",
+                }
+            },
+            "required": ["query"],
+        },
+    },
+}
+
+
 def build_handoff_tool(targets):
     """
     handoff_to_role のtool定義を動的に作る。
@@ -192,6 +215,7 @@ TOOL_REGISTRY = {
     "execute_command": EXECUTE_COMMAND_TOOL,
     "edit_file": EDIT_FILE_TOOL,
     "read_file": READ_FILE_TOOL,
+    "search_web": SEARCH_WEB_TOOL,
 }
 
 
@@ -241,6 +265,11 @@ def tool_calls_to_actions(tool_calls):
             note = args.get("note")
             if isinstance(note, str) and note.strip():
                 actions.append({"type": "remember", "note": note.strip()})
+
+        elif name == "search_web":
+            query = args.get("query")
+            if isinstance(query, str) and query.strip():
+                actions.append({"type": "search", "query": query.strip()})
 
     return actions
 

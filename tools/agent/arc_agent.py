@@ -39,6 +39,7 @@ from scripts.tools import (
     strip_think_blocks,
 )
 from scripts.display import stream_chat_response
+from scripts.skills import web_search
 from scripts.role_loader import load_role
 from scripts.memory import (
     start_session_log,
@@ -287,7 +288,25 @@ def run_command(command: str, mode: str) -> str:
 
     print(f"[RUNNING] -> {command}")
     try:
-        wrapped = "$ProgressPreference='SilentlyContinue'; " + command
+        # [NOTE] 文字化けの原因は2つ重なっていた。
+        # (1) 出力側: 日本語Windowsでは、PowerShellの標準出力は既定でコンソールの
+        #     コードページ(cp932)で書き出される。以前はここをutf-8で先にdecodeを
+        #     試みており、cp932のバイト列がたまたまutf-8として"エラー無く"decode
+        #     できてしまうケースで文字化けが起きていた（decode自体は成功するので
+        #     フォールバックのcp932側に落ちない）。
+        # (2) 入力側: Windows PowerShell 5.1のGet-Content等は、UTF-8(BOM無し)の
+        #     ファイルを読む時、既定ではシステムのコードページ(cp932)として読んで
+        #     しまう（BOM付きUTF-8/UTF-16でなければ自動判定されない）。この
+        #     リポジトリのファイルはBOM無しUTF-8で保存されているため、Get-Content
+        #     経由で読むと内部表現の時点で既に化けており、正しい日本語パターンで
+        #     Select-Stringしても一致しない、という無言の不具合になっていた。
+        # 両方をutf-8に固定することで解消する。
+        wrapped = (
+            "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; "
+            "$OutputEncoding = [System.Text.Encoding]::UTF8; "
+            "$PSDefaultParameterValues['*:Encoding'] = 'utf8'; "
+            "$ProgressPreference='SilentlyContinue'; " + command
+        )
         encoded = base64.b64encode(wrapped.encode("utf-16-le")).decode("ascii")
         ps_command = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
                       "-EncodedCommand", encoded]
@@ -540,6 +559,13 @@ def start_interactive_chat(model_name: str, exec_mode: str, server_proc,
                         feedback_parts.append(res)
                     elif act["type"] == "remember":
                         res = run_remember(act)
+                        feedback_parts.append(res)
+                    elif act["type"] == "search":
+                        print(f"\n[SEARCH REQUESTED] クエリ: {act['query']}")
+                        res = web_search(act["query"])
+                        MAX_FEEDBACK = 14000
+                        if len(res) > MAX_FEEDBACK:
+                            res = res[:MAX_FEEDBACK] + "\n...(長いため省略)"
                         feedback_parts.append(res)
 
                 feedback = "\n\n".join(feedback_parts)

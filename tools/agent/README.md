@@ -33,6 +33,22 @@ GPU(VRAM)が1本しかないため、複数の役を同時には動かせない�
 `edit_file`は持たない。実装を増やさず、role.jsonの`tools`を絞るだけで
 「調査はするが変更はしない役」を作れることの実例。
 
+### 役（role）とスキル（skill）の違い
+
+「役」はモデル+プロンプト+専門性の組み合わせ（誰が、という単位）。
+「スキル」は副作用が無い/軽い、単独で完結する能力の実装（何ができるか、という単位）で、
+特定の役に紐づかない。例えばWeb検索は、それ専用の役（人格）を作る必要は無く、
+どの役の`tools`にも`search_web`を足すだけで使い回せる。
+
+- スキルの**スキーマ**（Ollamaに渡すtool定義のJSON）は他のtoolと同じく
+  `scripts/tools.py`の`TOOL_REGISTRY`に登録する。
+- スキルの**実装**（実際に何をするか）は`scripts/skills.py`に置く。現状は
+  `web_search()`（DuckDuckGoのHTML版をスクレイピング。APIキー不要）のみ。
+- `execute_command`/`edit_file`/`read_file`は`scripts/skills.py`には無い。
+  承認フロー(exec_mode)・WORK_DIR・物理防御カウンタ等、Execute役の対話ループに
+  深く統合されているため、意図的にそちらには移していない。スキルに向くのは、
+  そういった状態を一切持たず、引数だけで完結する能力（調べるだけ、計算するだけ等）。
+
 ### 新しい役を追加するには
 
 `roles/<role_id>/` に以下の2ファイルを置く。
@@ -222,6 +238,7 @@ Ollamaのtool calling（function calling）で実装している。モデルに�
 | `execute_command` | `command` | PowerShellコマンドを1つ実行 |
 | `edit_file` | `file`, `search`, `replace` | SEARCH/REPLACE形式のピンポイント編集 |
 | `read_file` | `file` | ファイルを行番号付きで読む（文字化け対策） |
+| `search_web` | `query` | インターネット検索（スキル。詳細は後述） |
 | `remember` | `note` | 共有メモに書き残す |
 | `return_to_caller` | `summary` | 作業完了。呼び出し元に会話を戻す（関数のreturn） |
 
@@ -231,9 +248,25 @@ Ollamaのtool calling（function calling）で実装している。モデルに�
 |------|------|------|
 | `execute_command` | `command` | 調査目的のみ（`is_read_only_command()`の判定は変わらないため、変更系コマンドは承認要求される） |
 | `read_file` | `file` | ファイルを行番号付きで読む |
+| `search_web` | `query` | インターネット検索（スキル。詳細は後述） |
 | `remember` | `note` | 共有メモに書き残す |
 | `return_to_caller` | `summary` | 確認完了。呼び出し元に会話を戻す（関数のreturn） |
 | ~~`edit_file`~~ | - | `role.json`の`tools`に含めていないため使えない |
+
+### スキル系tool
+
+| tool | 引数 | 用途 | 実装 |
+|------|------|------|------|
+| `search_web` | `query` | DuckDuckGoのHTML版を検索し、上位結果（タイトル・URL・要約）を返す。副作用無し。APIキー不要 | `scripts/skills.py`の`web_search()` |
+
+[NOTE] 実機テストで確認した状態: `search_web`自体の呼び出し・DuckDuckGoからの結果取得・
+`return_to_caller`までの一連の動作は、Review役に直接指示を渡した時は問題無く動く
+（役の実装として完成している）。一方、雑談役が会話から自発的に「これはsearch_webが
+要る」と判断してhandoff_to_roleを呼ぶ精度はまだ不安定（qwen2.5-coder:14bで、
+「〜についてネットで調べて」という明示的な依頼でも引き継がずに終わることがあった）。
+プロンプト（`roles/chat/prompt.txt`）に例を足したが完全には安定していない。
+モデル選定の経緯で書いた「小型ローカルモデルは判断を誤ることがある」の一種として、
+今後の調整項目。
 
 いずれも1返答につき1回だけ呼ぶ設計（各役の`roles/<role_id>/prompt.txt`で明示）。
 
@@ -291,6 +324,26 @@ Execute役の既定モデルも同じ qwen2.5-coder:14b。これは `roles/execu
 `run_chat_loop()` / `start_interactive_chat()` は、想定していない例外（バグ等）で
 関数を抜けた場合でも `finally` でVRAM解放だけは必ず行うようにしてある。
 
+### execute_commandの文字化け（修正済み）
+
+原因は2つ重なっていた。
+1. **出力側**: 日本語Windowsでは、PowerShellの標準出力は既定でコンソールのコード
+   ページ(cp932)で書き出される。以前はPython側で`utf-8`decodeを先に試みており、
+   cp932のバイト列がたまたま`utf-8`として"エラー無く"decodeできてしまうケースで
+   文字化けが起きていた（decode自体は成功するため、フォールバックのcp932側に
+   落ちない）。
+2. **入力側**: Windows PowerShell 5.1の`Get-Content`等は、UTF-8(BOM無し)のファイル
+   を読む時、既定ではシステムのコードページ(cp932)として読んでしまう（BOM付き
+   UTF-8/UTF-16でなければ自動判定されない）。このリポジトリのファイルはBOM無し
+   UTF-8で保存されているため、`Get-Content`経由で読むと内部表現の時点で既に
+   化けており、正しい日本語パターンで`Select-String`しても一致しない、という
+   無言の不具合になっていた（エラーにならないため気づきにくい）。
+
+`run_command()`が組み立てるPowerShellコマンドの先頭に、出力エンコーディング
+（`[Console]::OutputEncoding` / `$OutputEncoding`）と、`Get-Content`等の既定
+エンコーディング（`$PSDefaultParameterValues['*:Encoding']`）を両方`utf8`に
+固定する前置きを追加して解消した。
+
 ### モジュール共用時のtool制限漏れ（修正済み）
 
 Review役を追加する際に発見。`arc_agent.py`は元々Execute役専用に書かれており、
@@ -328,6 +381,7 @@ tools/agent/
     ├── config.py               定数（ファイル名等）
     ├── ollama.py               Ollamaサーバーのライフサイクル管理（起動・停止・VRAM解放）
     ├── tools.py                  tool定義・TOOL_REGISTRY・tool_calls⇔内部アクション形式の変換
+    ├── skills.py                   役をまたいで再利用できる能力の実装（現状はweb_search）
     ├── display.py                 ストリーム応答の表示（Spinner・思考中/出力中表示）。役をまたいで共通
     ├── role_loader.py            roles/ からの役の読み込み。専門性・引き継ぎ先の解決も担う
     ├── dispatch.py                役の入れ子呼び出しの共通化（role.jsonの"module"を動的import）
