@@ -16,10 +16,15 @@
 
     def start_interactive_chat(model_name, exec_mode, server_proc, *,
                                 initial_message=None, is_nested=False,
-                                log_path=None, **kwargs): ...
+                                log_path=None, role_id=None, **kwargs): ...
 
        戻り値: 呼び出し元への報告文字列（return_to_callerが呼ばれた場合）、
               それ以外の終了ならNone。
+
+       role_id: 複数の役が同じモジュールを共用する場合がある（例:
+       roles/execute と roles/review が両方とも arc_agent.py を使うが、
+       tool一覧やプロンプトは別）。実装側はrole_idを見て、モジュール内で
+       決め打ちにせず roles/<role_id>/ の定義を都度読み込むこと。
 """
 
 import importlib
@@ -51,4 +56,5 @@ def invoke_role(base_dir, role_id, server_proc, instructions, log_path):
     return entry(
         role["model"], "safe", server_proc,
         initial_message=instructions, is_nested=True, log_path=log_path,
+        role_id=role_id,
     )

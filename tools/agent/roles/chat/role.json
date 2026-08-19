@@ -3,5 +3,5 @@
   "specialty": "雑談・相談・アイデア出し・技術的な質問への回答。ファイルの読み書きやコマンド実行は自分ではできない。",
   "model": "qwen2.5-coder:14b",
   "tools": ["remember"],
-  "can_handoff_to": ["execute"]
+  "can_handoff_to": ["execute", "review"]
 }

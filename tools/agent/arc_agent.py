@@ -324,9 +324,10 @@ def run_command(command: str, mode: str) -> str:
 def start_interactive_chat(model_name: str, exec_mode: str, server_proc,
                            debug_mode: bool = False, raw_dump: bool = False,
                            initial_message: str = None, is_nested: bool = False,
-                           num_ctx: int = 8192, log_path: str = None):
+                           num_ctx: int = 8192, log_path: str = None,
+                           role_id: str = None):
     """
-    Execute役のセッション本体。
+    このファイルの実装を使う役（既定はExecute役）のセッション本体。
 
     is_nested=True の場合、他の役から直接呼び出されている（入れ子呼び出し）。
     この場合は自分でOllamaサーバーを止めたりしない（呼び出し元と共有しているため）。
@@ -338,10 +339,22 @@ def start_interactive_chat(model_name: str, exec_mode: str, server_proc,
     log_path: 呼び出し元から共通のセッションログを渡された場合はそこに追記する
     （役をまたいでも1つのログで会話の続きを追えるようにするため）。
     未指定（単体起動時）なら自分で新しいログファイルを作る。
+
+    role_id: このファイル(arc_agent.py)を"module"として使う役はExecute以外にも
+    ありうる（例: 読み取り専用のReview役）。role_idを指定すると、モジュール
+    読み込み時に固定された execute のプロンプト/tool一覧ではなく、
+    roles/<role_id>/ の定義を都度読み込んで使う。未指定なら従来通り execute。
+    [IMPORTANT] モジュール直下の `ROLE` はimport時に一度だけ読まれる固定値
+    （execute用）なので、他の役がこのモジュールを共用する時は必ずrole_idを渡すこと。
+    渡し忘れると、その役のtool制限（例: edit_fileを持たせない）が効かず、
+    実際にはExecute役と同じ全toolが使えてしまう。
     """
+    role = load_role(BASE_DIR, role_id) if role_id else ROLE
+    log_role_name = role_id or ROLE_ID
+
     warmup_model(model_name)
     if log_path is None:
-        log_path = start_session_log(BASE_DIR, "execute")
+        log_path = start_session_log(BASE_DIR, log_role_name)
 
     def teardown(summary=None):
         """呼び出し元に返す前の後片付け。nestedならモデル解放だけ、単体ならサーバーも止める。"""
@@ -374,7 +387,7 @@ def start_interactive_chat(model_name: str, exec_mode: str, server_proc,
         print("[MODE] ログモード有効（生ストリーム＋会話ファイル保存）")
     print("※ 終了: 'exit'/'quit' / 送信: 新しい行で 'EOF' か Ctrl+Z/Ctrl+D\n")
 
-    messages = [{"role": "system", "content": build_system_prompt_with_memory(ROLE["prompt"], BASE_DIR)}]
+    messages = [{"role": "system", "content": build_system_prompt_with_memory(role["prompt"], BASE_DIR)}]
     print("[AI] 初期化が完了しました。質問をどうぞ。")
 
     MAX_AUTO_STEPS = 12
@@ -426,7 +439,7 @@ def start_interactive_chat(model_name: str, exec_mode: str, server_proc,
                 payload = json.dumps({
                     "model": model_name,
                     "messages": messages,
-                    "tools": ROLE["tools"],
+                    "tools": role["tools"],
                     "stream": True,
                     "keep_alive": KEEP_ALIVE,
                     "options": {

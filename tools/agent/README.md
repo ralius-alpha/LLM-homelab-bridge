@@ -26,6 +26,12 @@ GPU(VRAM)が1本しかないため、複数の役を同時には動かせない�
 |----|------|----------------------|-----------|
 | 雑談役 (chat) | `roles/chat/` | `chat_agent.py` | 会話のみ。ファイル操作・コマンド実行は不可 |
 | Execute役 (execute) | `roles/execute/` | `arc_agent.py` | コマンド実行・ファイル編集・共有メモ書き込み |
+| Review役 (review) | `roles/review/` | `arc_agent.py`（Execute役と共用） | ファイルを読んで指摘するだけ。編集不可（`tools`に`edit_file`を含めていない） |
+
+[NOTE] Review役はExecute役と同じ`arc_agent.py`を`module`として使うが、`tools`は
+`read_file`/`execute_command`/`remember`/`return_to_caller`だけに絞ってあり、
+`edit_file`は持たない。実装を増やさず、role.jsonの`tools`を絞るだけで
+「調査はするが変更はしない役」を作れることの実例。
 
 ### 新しい役を追加するには
 
@@ -76,9 +82,15 @@ Aのプロンプトの末尾にも「自分の専門性はこれ、それ以外�
   ```python
   def start_interactive_chat(model_name, exec_mode, server_proc, *,
                               initial_message=None, is_nested=False,
-                              log_path=None, **kwargs): ...
+                              log_path=None, role_id=None, **kwargs): ...
   # 戻り値: return_to_callerが呼ばれれば要約文字列、それ以外の終了ならNone
   ```
+  [IMPORTANT] `role_id`は「複数の役が同じモジュールを共用できる」ようにするための
+  引数。実装側はモジュール読み込み時に固定されたグローバルなroleを常に使うのではなく、
+  `role_id`が渡されたらそちらの`roles/<role_id>/`定義を都度読み込むこと（`arc_agent.py`
+  の実装を参照）。これを怠ると、tool一覧を絞ったつもりの役（例: Review役に`edit_file`を
+  持たせない）が、実際にはモジュール既定の役と同じ全toolを使えてしまうという事故が起こる
+  （Review役を追加した際に実際に踏んだ不具合。詳細は「既知の不具合と対策」参照）。
 - 戻る側も `return_to_caller`（引数`summary`のみ）という1つのtoolに統一されている。
   「雑談役に戻る」という名前ではなく「呼び出し元に戻る」なので、将来Execute役以外の
   役からExecute役を呼ぶケースが増えても意味が破綻しない。
@@ -200,7 +212,7 @@ Ollamaのtool calling（function calling）で実装している。モデルに�
 
 | tool | 引数 | 用途 |
 |------|------|------|
-| `handoff_to_role` | `role_id="execute"`, `instructions`, `reason` | `roles/chat/role.json`の`can_handoff_to`が`["execute"]`なので実質Execute役限定 |
+| `handoff_to_role` | `role_id`（`"execute"`か`"review"`）, `instructions`, `reason` | `roles/chat/role.json`の`can_handoff_to`が`["execute", "review"]`なのでこの2つに限定 |
 | `remember` | `note` | 共有メモに書き残す |
 
 ### Execute役固有
@@ -212,6 +224,16 @@ Ollamaのtool calling（function calling）で実装している。モデルに�
 | `read_file` | `file` | ファイルを行番号付きで読む（文字化け対策） |
 | `remember` | `note` | 共有メモに書き残す |
 | `return_to_caller` | `summary` | 作業完了。呼び出し元に会話を戻す（関数のreturn） |
+
+### Review役固有
+
+| tool | 引数 | 用途 |
+|------|------|------|
+| `execute_command` | `command` | 調査目的のみ（`is_read_only_command()`の判定は変わらないため、変更系コマンドは承認要求される） |
+| `read_file` | `file` | ファイルを行番号付きで読む |
+| `remember` | `note` | 共有メモに書き残す |
+| `return_to_caller` | `summary` | 確認完了。呼び出し元に会話を戻す（関数のreturn） |
+| ~~`edit_file`~~ | - | `role.json`の`tools`に含めていないため使えない |
 
 いずれも1返答につき1回だけ呼ぶ設計（各役の`roles/<role_id>/prompt.txt`で明示）。
 
@@ -269,6 +291,20 @@ Execute役の既定モデルも同じ qwen2.5-coder:14b。これは `roles/execu
 `run_chat_loop()` / `start_interactive_chat()` は、想定していない例外（バグ等）で
 関数を抜けた場合でも `finally` でVRAM解放だけは必ず行うようにしてある。
 
+### モジュール共用時のtool制限漏れ（修正済み）
+
+Review役を追加する際に発見。`arc_agent.py`は元々Execute役専用に書かれており、
+モジュールの先頭で `ROLE = load_role(BASE_DIR, "execute")` と一度だけ読み込んで
+いた。Review役が同じ`arc_agent.py`を`module`として指定しても、関数内部が
+このモジュール直下の`ROLE`（execute固定）を参照している限り、実際に使われる
+プロンプトとtool一覧はexecuteのものになってしまい、Review役の`role.json`で
+`edit_file`を外していても意味が無い（読み取り専用のつもりが編集可能なまま）
+という事故になるところだった。
+`start_interactive_chat()`に`role_id`引数を追加し、渡された場合はモジュール直下の
+`ROLE`ではなく`load_role(BASE_DIR, role_id)`を都度読み込んで使うように修正。
+`scripts/dispatch.py`の`invoke_role()`が常に`role_id`を渡すため、以後この種の
+役は安全に追加できる。
+
 ---
 
 ## ファイル構成
@@ -282,9 +318,12 @@ tools/agent/
 │   ├── chat/
 │   │   ├── role.json             雑談役の定義（モデル・専門性・使うtool名・引き継ぎ先）
 │   │   └── prompt.txt            雑談役システムプロンプト
-│   └── execute/
-│       ├── role.json             Execute役の定義（モデル・専門性・使うtool名・実装module）
-│       └── prompt.txt            Execute役システムプロンプト
+│   ├── execute/
+│   │   ├── role.json             Execute役の定義（モデル・専門性・使うtool名・実装module）
+│   │   └── prompt.txt            Execute役システムプロンプト
+│   └── review/
+│       ├── role.json             Review役の定義（Execute役と同じmoduleだがtoolsを読み取り専用に絞る）
+│       └── prompt.txt            Review役システムプロンプト
 └── scripts/
     ├── config.py               定数（ファイル名等）
     ├── ollama.py               Ollamaサーバーのライフサイクル管理（起動・停止・VRAM解放）
