@@ -59,11 +59,31 @@ from scripts.memory import (
 # （中国語文字等）を時々出す。素のprintだと即クラッシュするため、置換表示に倒す。
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+# [NOTE] stdoutだけreconfigureしてstdinを忘れると、標準入力がリダイレクト/パイプ
+# 経由（対話的なコンソールでない）の時に、Pythonがコンソールの既定コードページ
+# (cp932)でinput()をdecodeしてしまい、UTF-8で書かれた日本語の入力が丸ごと
+# 文字化けする（エラーにはならず、無言で化けた文字列がそのままモデルに渡る）。
+# [IMPORTANT] reconfigure()はストリームから1度でも読み込んだ後には呼べない
+# （RuntimeErrorになる）。この呼び出しはinput()より確実に前（モジュール読み込み時）
+# に実行されるので通常は問題無いが、念のためtry/exceptで囲む。
+if hasattr(sys.stdin, "reconfigure"):
+    try:
+        sys.stdin.reconfigure(encoding="utf-8", errors="replace")
+    except (RuntimeError, ValueError):
+        pass
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ROLE_ID = "chat"
 ROLE = load_role(BASE_DIR, ROLE_ID)
 CHAT_MODEL = ROLE["model"]
+
+# [NOTE] 以前はここにnum_ctxが無く、Ollamaの既定値（多くの場合2048〜4096）に
+# 依存していた。雑談役のシステムプロンプトは役が増えるたびに大きくなって
+# おり（6役分のtool定義＋自己認識ブロック込みで数千トークン規模）、既定値では
+# 会話が始まる前から黙って切り詰められていた可能性がある（エラーにならない
+# ため気づきにくい）。arc_agent.py側は元からnum_ctxを明示していたが、
+# chat_agent.py側は抜けていたため揃える。
+CHAT_NUM_CTX = 8192
 
 
 def run_role_and_wait(server_proc, role_id, instructions, log_path):
@@ -154,7 +174,7 @@ def run_chat_loop(model_name, server_proc, log_path):
                 "tools": ROLE["tools"],
                 "stream": True,
                 "keep_alive": KEEP_ALIVE,
-                "options": {"temperature": 0.6, "top_p": 0.9},
+                "options": {"temperature": 0.6, "top_p": 0.9, "num_ctx": CHAT_NUM_CTX},
             }).encode("utf-8")
             req = urllib.request.Request(
                 f"{OLLAMA_HOST}/api/chat", data=payload,

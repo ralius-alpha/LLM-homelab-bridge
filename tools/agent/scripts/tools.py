@@ -414,6 +414,47 @@ def _extract_json_objects(text):
     return objects
 
 
+_KNOWN_TOOL_NAMES = set(TOOL_REGISTRY) | {"handoff_to_role"}
+
+_FUNC_CALL_NAME_RE = re.compile(r'\b([a-zA-Z_][a-zA-Z0-9_]*)\s*\(\s*\{')
+
+
+def _extract_function_call_style(text):
+    """
+    テキストから `funcName({...})` というプログラミング言語の関数呼び出し風の
+    表記を探し、(name, json文字列) のペアを全て返す。モデルがtool呼び出し
+    機能を使わず、こうした疑似コードを文章として書いてしまうことがある
+    （例: `handoff_to_role({"role_id": "review", ...})`）ための救済フォールバック。
+    誤検知を防ぐため、既知のtool名にマッチするものだけを対象にする。
+    """
+    results = []
+    for m in _FUNC_CALL_NAME_RE.finditer(text):
+        name = m.group(1)
+        if name not in _KNOWN_TOOL_NAMES:
+            continue
+        brace_start = m.end() - 1  # '{' の位置
+        depth = 0
+        end = None
+        for i in range(brace_start, len(text)):
+            ch = text[i]
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    end = i
+                    break
+        if end is None:
+            continue
+        # 閉じ括弧の直後（空白を挟んで）が ')' であることを確認し、
+        # 本当に関数呼び出しの形をしているかを見る。
+        rest = text[end + 1:end + 5].lstrip()
+        if not rest.startswith(")"):
+            continue
+        results.append((name, text[brace_start:end + 1]))
+    return results
+
+
 def tool_call_from_content(text):
     """
     tool_callsを返さず、{"name": ..., "arguments": {...}} 形式のJSONを
@@ -421,7 +462,8 @@ def tool_call_from_content(text):
     1つの返答に複数のtool呼び出しJSONが並ぶこともあるため、見つかった
     有効なもの全てをtool_calls形式のリストで返す。該当が無ければ None。
     """
-    candidates = _extract_json_objects(strip_think_blocks(text))
+    text = strip_think_blocks(text)
+    candidates = _extract_json_objects(text)
     tool_calls = []
     for candidate in candidates:
         try:
@@ -435,6 +477,20 @@ def tool_call_from_content(text):
         if not name or not isinstance(args, dict):
             continue
         tool_calls.append({"function": {"name": name, "arguments": args}})
+
+    if not tool_calls:
+        # JSONの{"name":...,"arguments":{...}}形式が1つも無かった時だけ、
+        # `funcName({...})` 形式も試す（通常のJSON形式が既にあるなら、
+        # そちらを優先しこちらは見ない）。
+        for name, json_str in _extract_function_call_style(text):
+            try:
+                args = json.loads(json_str)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if not isinstance(args, dict):
+                continue
+            tool_calls.append({"function": {"name": name, "arguments": args}})
+
     return tool_calls or None
 
 

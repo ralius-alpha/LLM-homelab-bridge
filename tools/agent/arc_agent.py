@@ -15,6 +15,21 @@ from datetime import datetime
 # 出すことがある。素のprintだと即クラッシュするため、置換表示に倒す。
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+# [NOTE] stdoutだけreconfigureしてstdinを忘れると、標準入力がリダイレクト/パイプ
+# 経由（対話的なコンソールでない）の時に、Pythonがコンソールの既定コードページ
+# (cp932)でinput()をdecodeしてしまい、UTF-8で書かれた日本語の入力が丸ごと
+# 文字化けする（エラーにはならず、無言で化けた文字列がそのままモデルに渡る）。
+# [IMPORTANT] reconfigure()はストリームから1度でも読み込んだ後には呼べない
+# （RuntimeError）。chat_agent.pyからの入れ子呼び出しでは、このモジュールが
+# importされる時点で既にchat_agent.py側がstdinから読み込み済み（同じプロセス・
+# 同じsys.stdin）なので、ここでのreconfigureは常に失敗する。失敗しても
+# chat_agent.py側で既に正しくreconfigure済みなので実害は無く、try/exceptで
+# 無視してよい（単体起動時は逆にこちらが最初のreconfigureになるので効く）。
+if hasattr(sys.stdin, "reconfigure"):
+    try:
+        sys.stdin.reconfigure(encoding="utf-8", errors="replace")
+    except (RuntimeError, ValueError):
+        pass
 
 from scripts.config import (
     OLLAMA_HOST,
