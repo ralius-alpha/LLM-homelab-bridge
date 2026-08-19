@@ -25,13 +25,18 @@ GPU(VRAM)が1本しかないため、複数の役を同時には動かせない�
 | 役 | 定義 | 実行する側のモジュール | できること |
 |----|------|----------------------|-----------|
 | 雑談役 (chat) | `roles/chat/` | `chat_agent.py` | 会話のみ。ファイル操作・コマンド実行は不可 |
-| Execute役 (execute) | `roles/execute/` | `arc_agent.py` | コマンド実行・ファイル編集・共有メモ書き込み |
-| Review役 (review) | `roles/review/` | `arc_agent.py`（Execute役と共用） | ファイルを読んで指摘するだけ。編集不可（`tools`に`edit_file`を含めていない） |
+| Execute役 (execute) | `roles/execute/` | `arc_agent.py` | コマンド実行・ファイル編集・調査系スキル・共有メモ書き込み |
+| Review役 (review) | `roles/review/` | `arc_agent.py`（共用） | ファイルを読んで指摘するだけ。編集不可 |
+| Plan役 (plan) | `roles/plan/` | `arc_agent.py`（共用） | 依頼を実行前に順序立てた計画に分解する。実行はしない |
+| Writer役 (writer) | `roles/writer/` | `arc_agent.py`（共用） | コード・ログを説明文/記事に書き起こす。ファイル編集は不可 |
+| Debug役 (debug) | `roles/debug/` | `arc_agent.py`（共用） | コマンドで再現・調査し原因を特定する。修正はしない |
+| Test役 (test) | `roles/test/` | `arc_agent.py`（共用） | 既存のテストを実行し結果を報告する。修正はしない |
 
-[NOTE] Review役はExecute役と同じ`arc_agent.py`を`module`として使うが、`tools`は
-`read_file`/`execute_command`/`remember`/`return_to_caller`だけに絞ってあり、
-`edit_file`は持たない。実装を増やさず、role.jsonの`tools`を絞るだけで
-「調査はするが変更はしない役」を作れることの実例。
+[NOTE] chat以外の6役はすべて同じ`arc_agent.py`を`module`として共用している。
+違いは`role.json`の`tools`（例えばReview/Plan/Writer/Debug/Testは`edit_file`を
+持たない）と`prompt.txt`の専門性の記述だけで、新しい実装コードは1行も増えて
+いない。実装を増やさず、role.jsonの`tools`を絞るだけで専門特化した役を
+作れることの実例（詳細は後述の「モジュール共用時のtool制限漏れ」も参照）。
 
 ### 役（role）とスキル（skill）の違い
 
@@ -42,8 +47,19 @@ GPU(VRAM)が1本しかないため、複数の役を同時には動かせない�
 
 - スキルの**スキーマ**（Ollamaに渡すtool定義のJSON）は他のtoolと同じく
   `scripts/tools.py`の`TOOL_REGISTRY`に登録する。
-- スキルの**実装**（実際に何をするか）は`scripts/skills.py`に置く。現状は
-  `web_search()`（DuckDuckGoのHTML版をスクレイピング。APIキー不要）のみ。
+- スキルの**実装**（実際に何をするか）は`scripts/skills.py`に置く。現状4種類:
+  - `web_search()` — DuckDuckGoのHTML版を検索（APIキー不要）
+  - `fetch_url()` — 指定URLの本文をテキストで取得
+  - `summarize_text()` — 呼び出し元が**既にロード済みのモデル**を使って要約する
+    （新規にモデルをロードし直さないため、VRAM制約を破らない。model_nameは
+    tool呼び出し時にモデル自身が指定するのではなく、呼び出し元コードが埋める）
+  - `calculate()` — 四則演算・べき乗のみを許可するASTホワイトリスト方式の電卓
+    （変数参照・関数呼び出し・属性アクセスは一切評価しない。任意のPythonコード
+    実行はできない。汎用的な"run_python"のようなtoolは、execute_commandの
+    承認フローを経ずに何でもできてしまい安全に置けないため、あえてこの
+    電卓程度の機能に絞ってある）
+  - `git_diff_summary()` — `git status`/`git diff`の生データを取得（要約は
+    これを読んだ側のモデルが行う）
 - `execute_command`/`edit_file`/`read_file`は`scripts/skills.py`には無い。
   承認フロー(exec_mode)・WORK_DIR・物理防御カウンタ等、Execute役の対話ループに
   深く統合されているため、意図的にそちらには移していない。スキルに向くのは、
@@ -179,8 +195,10 @@ main() in chat_agent.py
 - **副次効果**: コンソールウィンドウが新しく開いたり閉じたりすることが無くなった。
   Execute役が例外で落ちても、呼び出し元(雑談役)の`try/except`で捕まえて
   会話を継続できる（プロセスごと落ちる旧設計より頑健）。
-- 将来Plan役・Review役等を追加する場合も、必要な役の関数を呼んで結果を受け取るだけでよく、
+- 役を追加する場合も、必要な役の関数を呼んで結果を受け取るだけでよく、
   入れ子は自然に深くなる（プロセス管理の仕組みを都度増やす必要が無い）。
+  実際にReview/Plan/Writer/Debug/Testの5役を追加した際も、この呼び出し部分
+  （`chat_agent.py`・`scripts/dispatch.py`）は無改修で済んだ。
 
 ---
 
@@ -228,7 +246,7 @@ Ollamaのtool calling（function calling）で実装している。モデルに�
 
 | tool | 引数 | 用途 |
 |------|------|------|
-| `handoff_to_role` | `role_id`（`"execute"`か`"review"`）, `instructions`, `reason` | `roles/chat/role.json`の`can_handoff_to`が`["execute", "review"]`なのでこの2つに限定 |
+| `handoff_to_role` | `role_id`（`execute`/`review`/`plan`/`writer`/`debug`/`test`）, `instructions`, `reason` | `roles/chat/role.json`の`can_handoff_to`がこの6つ |
 | `remember` | `note` | 共有メモに書き残す |
 
 ### Execute役固有
@@ -238,7 +256,10 @@ Ollamaのtool calling（function calling）で実装している。モデルに�
 | `execute_command` | `command` | PowerShellコマンドを1つ実行 |
 | `edit_file` | `file`, `search`, `replace` | SEARCH/REPLACE形式のピンポイント編集 |
 | `read_file` | `file` | ファイルを行番号付きで読む（文字化け対策） |
-| `search_web` | `query` | インターネット検索（スキル。詳細は後述） |
+| `search_web` | `query` | インターネット検索（スキル） |
+| `fetch_url` | `url` | 指定URLの本文を取得（スキル） |
+| `calculate` | `expression` | 正確な数式計算（スキル） |
+| `git_diff_summary` | (無し) | git status/diffの取得（スキル） |
 | `remember` | `note` | 共有メモに書き残す |
 | `return_to_caller` | `summary` | 作業完了。呼び出し元に会話を戻す（関数のreturn） |
 
@@ -248,27 +269,78 @@ Ollamaのtool calling（function calling）で実装している。モデルに�
 |------|------|------|
 | `execute_command` | `command` | 調査目的のみ（`is_read_only_command()`の判定は変わらないため、変更系コマンドは承認要求される） |
 | `read_file` | `file` | ファイルを行番号付きで読む |
-| `search_web` | `query` | インターネット検索（スキル。詳細は後述） |
+| `search_web` | `query` | インターネット検索（スキル） |
+| `fetch_url` | `url` | 指定URLの本文を取得（スキル） |
+| `git_diff_summary` | (無し) | git status/diffの取得（スキル。差分レビュー用） |
 | `remember` | `note` | 共有メモに書き残す |
 | `return_to_caller` | `summary` | 確認完了。呼び出し元に会話を戻す（関数のreturn） |
 | ~~`edit_file`~~ | - | `role.json`の`tools`に含めていないため使えない |
 
-### スキル系tool
+### Plan役固有
+
+| tool | 引数 | 用途 |
+|------|------|------|
+| `read_file` | `file` | 計画を立てる上での現状把握用 |
+| `search_web` | `query` | インターネット検索（スキル） |
+| `remember` | `note` | 共有メモに書き残す |
+| `return_to_caller` | `summary` | 立てた計画（番号付きステップ）を呼び出し元に返す |
+
+### Writer役固有
+
+| tool | 引数 | 用途 |
+|------|------|------|
+| `read_file` | `file` | 記事の材料になるファイルを読む |
+| `search_web` | `query` | インターネット検索（スキル） |
+| `fetch_url` | `url` | 指定URLの本文を取得（スキル） |
+| `summarize_text` | `text`, `instruction` | 長い材料を要点だけに圧縮（スキル） |
+| `remember` | `note` | 共有メモに書き残す |
+| `return_to_caller` | `summary` | 書き上げた文章そのものを返す（要約ではなく成果物） |
+
+### Debug役固有
+
+| tool | 引数 | 用途 |
+|------|------|------|
+| `read_file` | `file` | 関連ファイル・ログを読む |
+| `execute_command` | `command` | 再現・調査目的のみ（状態変更コマンドは使わない前提） |
+| `search_web` | `query` | インターネット検索（スキル。エラーメッセージの意味等） |
+| `fetch_url` | `url` | 指定URLの本文を取得（スキル） |
+| `remember` | `note` | 共有メモに書き残す |
+| `return_to_caller` | `summary` | 判明した原因（または切り分け状況）を返す |
+
+### Test役固有
+
+| tool | 引数 | 用途 |
+|------|------|------|
+| `read_file` | `file` | テスト・設定ファイルの確認 |
+| `execute_command` | `command` | テストの実行 |
+| `remember` | `note` | 共有メモに書き残す |
+| `return_to_caller` | `summary` | 成功/失敗件数・失敗内容を返す |
+
+### スキル系tool一覧
 
 | tool | 引数 | 用途 | 実装 |
 |------|------|------|------|
-| `search_web` | `query` | DuckDuckGoのHTML版を検索し、上位結果（タイトル・URL・要約）を返す。副作用無し。APIキー不要 | `scripts/skills.py`の`web_search()` |
+| `search_web` | `query` | DuckDuckGoのHTML版を検索し、上位結果（タイトル・URL・要約）を返す | `scripts/skills.py`の`web_search()` |
+| `fetch_url` | `url` | 指定URLの本文をテキストで取得 | `fetch_url()` |
+| `summarize_text` | `text`, `instruction` | 呼び出し元のモデルで文章を要約 | `summarize_text()` |
+| `calculate` | `expression` | 四則演算・べき乗を安全に計算（ASTホワイトリスト方式） | `calculate()` |
+| `git_diff_summary` | (無し) | git status/diffの生データを取得 | `git_diff_summary()` |
 
-[NOTE] 実機テストで確認した状態: `search_web`自体の呼び出し・DuckDuckGoからの結果取得・
-`return_to_caller`までの一連の動作は、Review役に直接指示を渡した時は問題無く動く
-（役の実装として完成している）。一方、雑談役が会話から自発的に「これはsearch_webが
-要る」と判断してhandoff_to_roleを呼ぶ精度はまだ不安定（qwen2.5-coder:14bで、
-「〜についてネットで調べて」という明示的な依頼でも引き継がずに終わることがあった）。
-プロンプト（`roles/chat/prompt.txt`）に例を足したが完全には安定していない。
+いずれも副作用が無い（何も変更しない）。
+
+[NOTE] 実機テストで確認した状態: `search_web`自体の呼び出し・結果取得・
+`return_to_caller`までの一連の動作は、役に直接指示を渡した時は問題無く動く
+（役の実装として完成している）。一方、雑談役が会話から自発的に「これは
+search_webが要る」と判断してhandoff_to_roleを呼ぶ精度はまだ不安定
+（qwen2.5-coder:14bで、「〜についてネットで調べて」という明示的な依頼でも
+引き継がずに終わることがあった）。プロンプト（`roles/chat/prompt.txt`）に例を
+足したが完全には安定していない。加えて、雑談役の`handoff_to_role`の`role_id`
+選択肢が2つ(execute/review)から6つ(execute/review/plan/writer/debug/test)に
+増えたことで、小型モデルの判断負荷はさらに上がっている可能性が高い。
 モデル選定の経緯で書いた「小型ローカルモデルは判断を誤ることがある」の一種として、
-今後の調整項目。
+今後の調整項目（プロンプトの表現を変える、判断だけ大きいモデルに任せる等）。
 
-いずれも1返答につき1回だけ呼ぶ設計（各役の`roles/<role_id>/prompt.txt`で明示）。
+いずれのtoolも1返答につき1回だけ呼ぶ設計（各役の`roles/<role_id>/prompt.txt`で明示）。
 
 ---
 
@@ -358,6 +430,22 @@ Review役を追加する際に発見。`arc_agent.py`は元々Execute役専用�
 `scripts/dispatch.py`の`invoke_role()`が常に`role_id`を渡すため、以後この種の
 役は安全に追加できる。
 
+### tool呼び出しを文章として書くだけで実行しない（プロンプトで軽減）
+
+Plan/Writer/Debug/Test役を追加した際の実機テストで、Debug役が`execute_command`
+成功後、次のターンで`return_to_caller`を実際には呼ばず、「return_to_caller」と
+いう単語を文章の末尾に書くだけで終える挙動を1回確認した（`tool_call_from_content()`
+が拾える形のJSONではないため、何も実行されない）。`is_nested=True`で戻り値が
+無いまま入力待ちに落ち、標準入力がEOFだったためそのまま正常終了はしたが、
+`return_to_caller`が呼ばれなかったので呼び出し元へは要約が渡らなかった。
+
+これは以前`roles/execute/prompt.txt`の手本セクションで踏んだのと同じ系統の
+問題（モデルがtool呼び出しを"文章として書き写すだけ"で済ませてしまう）。
+該当4役 + Review役の【絶対ルール】に「文章で書くだけでは実行されない。
+必ずtool呼び出し機能そのものを使うこと」という一文を追加したところ、再現
+テストでは解消した。ただし1回の再現テストで直っただけであり、統計的に
+解消したとまでは言えない。小型モデルの既知の不安定要素として引き続き注意する。
+
 ---
 
 ## ファイル構成
@@ -374,9 +462,21 @@ tools/agent/
 │   ├── execute/
 │   │   ├── role.json             Execute役の定義（モデル・専門性・使うtool名・実装module）
 │   │   └── prompt.txt            Execute役システムプロンプト
-│   └── review/
-│       ├── role.json             Review役の定義（Execute役と同じmoduleだがtoolsを読み取り専用に絞る）
-│       └── prompt.txt            Review役システムプロンプト
+│   ├── review/
+│   │   ├── role.json             Review役の定義（Execute役と同じmoduleだがtoolsを読み取り専用に絞る）
+│   │   └── prompt.txt            Review役システムプロンプト
+│   ├── plan/
+│   │   ├── role.json             Plan役の定義（計画立案のみ。実行系toolを持たない）
+│   │   └── prompt.txt            Plan役システムプロンプト
+│   ├── writer/
+│   │   ├── role.json             Writer役の定義（文章執筆のみ。編集系toolを持たない）
+│   │   └── prompt.txt            Writer役システムプロンプト
+│   ├── debug/
+│   │   ├── role.json             Debug役の定義（原因調査のみ。edit_fileを持たない）
+│   │   └── prompt.txt            Debug役システムプロンプト
+│   └── test/
+│       ├── role.json             Test役の定義（テスト実行のみ。edit_fileを持たない）
+│       └── prompt.txt            Test役システムプロンプト
 └── scripts/
     ├── config.py               定数（ファイル名等）
     ├── ollama.py               Ollamaサーバーのライフサイクル管理（起動・停止・VRAM解放）

@@ -1,0 +1,8 @@
+{
+  "display_name": "Test役",
+  "specialty": "既存のテストを実行し、結果（成功/失敗）を報告する。テストコードの作成や、失敗の修正は行わない。",
+  "model": "qwen2.5-coder:14b",
+  "tools": ["read_file", "execute_command", "remember", "return_to_caller"],
+  "module": "arc_agent",
+  "can_handoff_to": []
+}

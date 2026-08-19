@@ -29,4 +29,5 @@ __pycache__/
 ollama_server.log
 chat_server.log
 debug_chat_log_*.txt
+shared_memory.md
 *.bak

@@ -1,0 +1,8 @@
+{
+  "display_name": "Plan役",
+  "specialty": "複雑な依頼を、実行に移す前に順序立ったステップの計画に分解する。自分ではファイル編集・コマンド実行は行わない。",
+  "model": "qwen2.5-coder:14b",
+  "tools": ["read_file", "search_web", "remember", "return_to_caller"],
+  "module": "arc_agent",
+  "can_handoff_to": []
+}

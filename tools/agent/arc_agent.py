@@ -39,7 +39,7 @@ from scripts.tools import (
     strip_think_blocks,
 )
 from scripts.display import stream_chat_response
-from scripts.skills import web_search
+from scripts.skills import web_search, fetch_url, summarize_text, calculate, git_diff_summary
 from scripts.role_loader import load_role
 from scripts.memory import (
     start_session_log,
@@ -563,6 +563,28 @@ def start_interactive_chat(model_name: str, exec_mode: str, server_proc,
                     elif act["type"] == "search":
                         print(f"\n[SEARCH REQUESTED] クエリ: {act['query']}")
                         res = web_search(act["query"])
+                        MAX_FEEDBACK = 14000
+                        if len(res) > MAX_FEEDBACK:
+                            res = res[:MAX_FEEDBACK] + "\n...(長いため省略)"
+                        feedback_parts.append(res)
+                    elif act["type"] == "fetch_url":
+                        print(f"\n[FETCH REQUESTED] URL: {act['url']}")
+                        res = fetch_url(act["url"])
+                        MAX_FEEDBACK = 14000
+                        if len(res) > MAX_FEEDBACK:
+                            res = res[:MAX_FEEDBACK] + "\n...(長いため省略)"
+                        feedback_parts.append(res)
+                    elif act["type"] == "summarize":
+                        print("\n[SUMMARIZE REQUESTED]")
+                        res = summarize_text(act["text"], model_name, act.get("instruction"))
+                        feedback_parts.append(f"[SUMMARY]\n{res}")
+                    elif act["type"] == "calculate":
+                        print(f"\n[CALCULATE REQUESTED] {act['expression']}")
+                        res = calculate(act["expression"])
+                        feedback_parts.append(res)
+                    elif act["type"] == "git_diff":
+                        print("\n[GIT DIFF SUMMARY REQUESTED]")
+                        res = git_diff_summary(WORK_DIR)
                         MAX_FEEDBACK = 14000
                         if len(res) > MAX_FEEDBACK:
                             res = res[:MAX_FEEDBACK] + "\n...(長いため省略)"

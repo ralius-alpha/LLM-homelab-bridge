@@ -159,6 +159,89 @@ SEARCH_WEB_TOOL = {
     },
 }
 
+FETCH_URL_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "fetch_url",
+        "description": (
+            "指定したURLの内容を取得し、本文をテキストとして返す。"
+            "search_webの結果に出てきたURLの中身を実際に読みたい時に使う。"
+            "副作用は無い（何も変更しない）。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "url": {
+                    "type": "string",
+                    "description": "取得するURL（http://かhttps://で始まるもの）",
+                }
+            },
+            "required": ["url"],
+        },
+    },
+}
+
+SUMMARIZE_TEXT_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "summarize_text",
+        "description": (
+            "長い文章（ファイルの内容・検索結果・会話の抜粋など）を、"
+            "要点を保ったまま短く要約する。副作用は無い（何も変更しない）。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "text": {
+                    "type": "string",
+                    "description": "要約したい文章そのもの",
+                },
+                "instruction": {
+                    "type": "string",
+                    "description": "要約の観点（例: 'エラーの原因に絞って要約して'）。省略可",
+                },
+            },
+            "required": ["text"],
+        },
+    },
+}
+
+CALCULATE_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "calculate",
+        "description": (
+            "四則演算・べき乗の数式を正確に計算する。桁数の大きい計算や、"
+            "暗算で間違えやすい計算をする時は、自分で計算せず必ずこれを使うこと。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "expression": {
+                    "type": "string",
+                    "description": "計算したい数式（例: '(12345 + 678) * 2'）",
+                }
+            },
+            "required": ["expression"],
+        },
+    },
+}
+
+GIT_DIFF_SUMMARY_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "git_diff_summary",
+        "description": (
+            "現在の作業ディレクトリのgit status/diffをまとめて取得する。"
+            "コミット前の変更内容を確認したい時に使う。副作用は無い（何も変更しない）。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {},
+        },
+    },
+}
+
 
 def build_handoff_tool(targets):
     """
@@ -216,6 +299,10 @@ TOOL_REGISTRY = {
     "edit_file": EDIT_FILE_TOOL,
     "read_file": READ_FILE_TOOL,
     "search_web": SEARCH_WEB_TOOL,
+    "fetch_url": FETCH_URL_TOOL,
+    "summarize_text": SUMMARIZE_TEXT_TOOL,
+    "calculate": CALCULATE_TOOL,
+    "git_diff_summary": GIT_DIFF_SUMMARY_TOOL,
 }
 
 
@@ -270,6 +357,29 @@ def tool_calls_to_actions(tool_calls):
             query = args.get("query")
             if isinstance(query, str) and query.strip():
                 actions.append({"type": "search", "query": query.strip()})
+
+        elif name == "fetch_url":
+            url = args.get("url")
+            if isinstance(url, str) and url.strip():
+                actions.append({"type": "fetch_url", "url": url.strip()})
+
+        elif name == "summarize_text":
+            text = args.get("text")
+            if isinstance(text, str) and text.strip():
+                instruction = args.get("instruction")
+                actions.append({
+                    "type": "summarize",
+                    "text": text,
+                    "instruction": instruction if isinstance(instruction, str) else None,
+                })
+
+        elif name == "calculate":
+            expression = args.get("expression")
+            if isinstance(expression, str) and expression.strip():
+                actions.append({"type": "calculate", "expression": expression.strip()})
+
+        elif name == "git_diff_summary":
+            actions.append({"type": "git_diff"})
 
     return actions
 
