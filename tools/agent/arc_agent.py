@@ -669,7 +669,15 @@ def _final_report(messages, model_name, debug_mode, chat_log_file):
         if forced_return:
             return forced_return["summary"]
         return strip_think_blocks(report) or None
-    except urllib.error.URLError as e:
+    except Exception as e:
+        # [NOTE] 以前はurllib.error.URLErrorだけを捕まえていたが、暴走停止までに
+        # 会話が非常に長くなっているケース（例: 調査対象を無限に広げてしまった後）
+        # では、サーバー側がプロンプト処理中に落ちてHTTP 500を返した後、接続が
+        # 途中で切れて urllib.error.URLError ではない例外（ConnectionResetError等）
+        # になることを実機で確認した。narrow過ぎる例外捕捉だと、この場合エラーが
+        # ここで捕まらずstart_interactive_chat側のtry/finallyまで伝播してしまい、
+        # 何が起きたかの手がかり（このprint）が失われる。広めに捕まえて必ず
+        # ログ・画面に残す。
         print(f"\n[ERROR] 最終報告の生成に失敗: {e}")
         return None
 
