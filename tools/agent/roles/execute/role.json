@@ -1,0 +1,5 @@
+{
+  "display_name": "Execute役",
+  "model": "qwen2.5-coder:14b",
+  "tools": ["execute_command", "edit_file", "read_file", "remember", "return_to_chat"]
+}

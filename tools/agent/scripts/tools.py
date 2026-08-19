@@ -64,109 +64,119 @@ RETURN_TO_CHAT_TOOL = {
     },
 }
 
-TOOLS = [
-    REMEMBER_TOOL,
-    RETURN_TO_CHAT_TOOL,
-    {
-        "type": "function",
-        "function": {
-            "name": "execute_command",
-            "description": (
-                "Windows PowerShellでコマンドを1つ実行する。"
-                "調査・ファイル一覧・検索・コピー・移動などに使う。"
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "command": {
-                        "type": "string",
-                        "description": "実行するPowerShellコマンド（1個だけ）",
-                    }
-                },
-                "required": ["command"],
+EXECUTE_COMMAND_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "execute_command",
+        "description": (
+            "Windows PowerShellでコマンドを1つ実行する。"
+            "調査・ファイル一覧・検索・コピー・移動などに使う。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "command": {
+                    "type": "string",
+                    "description": "実行するPowerShellコマンド（1個だけ）",
+                }
             },
+            "required": ["command"],
         },
     },
-    {
-        "type": "function",
-        "function": {
-            "name": "edit_file",
-            "description": (
-                "既存ファイルの一部を SEARCH/REPLACE 形式でピンポイント編集する。"
-                "コード改造は必ずこれを使うこと。全文書き換えは禁止。"
-                "SEARCH には read_file 等で実際に確認した、実在する行のみを書く。"
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "file": {
-                        "type": "string",
-                        "description": "編集対象ファイルの実際のパス",
-                    },
-                    "search": {
-                        "type": "string",
-                        "description": "変更したい既存の行（一意に特定できる範囲で、実在する行のみ）",
-                    },
-                    "replace": {
-                        "type": "string",
-                        "description": "置き換え後の内容",
-                    },
-                },
-                "required": ["file", "search", "replace"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "read_file",
-            "description": (
-                "ファイルをUTF-8で読み、行番号付きで返す。"
-                "PowerShellのGet-Contentは文字化けの恐れがあるため、"
-                "ファイルを読む際は必ずこちらを使うこと。"
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "file": {
-                        "type": "string",
-                        "description": "読み込むファイルのパス",
-                    }
-                },
-                "required": ["file"],
-            },
-        },
-    },
-]
+}
 
-CHAT_TOOLS = [
-    REMEMBER_TOOL,
-    {
-        "type": "function",
-        "function": {
-            "name": "handoff_to_execute",
-            "description": (
-                "会話だけでは対応できず、実際にファイルの読み書きやコマンド実行が"
-                "必要な作業だと判断した時に呼ぶ。Execute役はこの会話の履歴を見られないため、"
-                "instructionsには何をしてほしいかを、それだけ読んで分かるように具体的に書くこと。"
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "instructions": {
-                        "type": "string",
-                        "description": "Execute役への具体的な作業指示（会話の要点をまとめたもの）",
-                    },
-                    "reason": {
-                        "type": "string",
-                        "description": "なぜ雑談では対応できず引き継ぎが必要なのか",
-                    },
+EDIT_FILE_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "edit_file",
+        "description": (
+            "既存ファイルの一部を SEARCH/REPLACE 形式でピンポイント編集する。"
+            "コード改造は必ずこれを使うこと。全文書き換えは禁止。"
+            "SEARCH には read_file 等で実際に確認した、実在する行のみを書く。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "file": {
+                    "type": "string",
+                    "description": "編集対象ファイルの実際のパス",
                 },
-                "required": ["instructions"],
+                "search": {
+                    "type": "string",
+                    "description": "変更したい既存の行（一意に特定できる範囲で、実在する行のみ）",
+                },
+                "replace": {
+                    "type": "string",
+                    "description": "置き換え後の内容",
+                },
             },
+            "required": ["file", "search", "replace"],
         },
     },
-]
+}
+
+READ_FILE_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "read_file",
+        "description": (
+            "ファイルをUTF-8で読み、行番号付きで返す。"
+            "PowerShellのGet-Contentは文字化けの恐れがあるため、"
+            "ファイルを読む際は必ずこちらを使うこと。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "file": {
+                    "type": "string",
+                    "description": "読み込むファイルのパス",
+                }
+            },
+            "required": ["file"],
+        },
+    },
+}
+
+HANDOFF_TO_EXECUTE_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "handoff_to_execute",
+        "description": (
+            "会話だけでは対応できず、実際にファイルの読み書きやコマンド実行が"
+            "必要な作業だと判断した時に呼ぶ。Execute役はこの会話の履歴を見られないため、"
+            "instructionsには何をしてほしいかを、それだけ読んで分かるように具体的に書くこと。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "instructions": {
+                    "type": "string",
+                    "description": "Execute役への具体的な作業指示（会話の要点をまとめたもの）",
+                },
+                "reason": {
+                    "type": "string",
+                    "description": "なぜ雑談では対応できず引き継ぎが必要なのか",
+                },
+            },
+            "required": ["instructions"],
+        },
+    },
+}
+
+# 名前 → tool定義。roles/<role>/role.json が "tools": ["read_file", ...] のように
+# 名前だけでtoolを指定できるようにするための引き当て表（scripts/role_loader.pyが使う）。
+TOOL_REGISTRY = {
+    "remember": REMEMBER_TOOL,
+    "return_to_chat": RETURN_TO_CHAT_TOOL,
+    "execute_command": EXECUTE_COMMAND_TOOL,
+    "edit_file": EDIT_FILE_TOOL,
+    "read_file": READ_FILE_TOOL,
+    "handoff_to_execute": HANDOFF_TO_EXECUTE_TOOL,
+}
+
+TOOLS = [REMEMBER_TOOL, RETURN_TO_CHAT_TOOL, EXECUTE_COMMAND_TOOL, EDIT_FILE_TOOL, READ_FILE_TOOL]
+
+CHAT_TOOLS = [REMEMBER_TOOL, HANDOFF_TO_EXECUTE_TOOL]
 
 
 def strip_think_blocks(text: str) -> str:

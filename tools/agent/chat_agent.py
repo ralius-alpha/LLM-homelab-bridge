@@ -26,7 +26,7 @@ import urllib.request
 import urllib.error
 
 import arc_agent
-from scripts.config import OLLAMA_HOST, KEEP_ALIVE, CHAT_MODEL, MODELS
+from scripts.config import OLLAMA_HOST, KEEP_ALIVE, MODELS
 from scripts.ollama import (
     setup_environment,
     cleanup_processes,
@@ -36,12 +36,12 @@ from scripts.ollama import (
     warmup_model,
 )
 from scripts.tools import (
-    CHAT_TOOLS,
     strip_think_blocks,
     tool_call_from_content,
     tool_calls_to_actions,
     handoff_from_tool_calls,
 )
+from scripts.role_loader import load_role
 from scripts.memory import (
     start_session_log,
     append_session_log,
@@ -55,17 +55,12 @@ if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-CHAT_PROMPT_FILE = os.path.join(BASE_DIR, "chat_prompt.txt")
+ROLE_ID = "chat"
+ROLE = load_role(BASE_DIR, ROLE_ID)
+CHAT_MODEL = ROLE["model"]
 
 # Execute役に引き継ぐ時の既定モデル（Qwen2.5-Coder 14B・推奨）
 EXECUTE_DEFAULT_MODEL_KEY = "6"
-
-
-def load_chat_prompt():
-    if os.path.exists(CHAT_PROMPT_FILE):
-        with open(CHAT_PROMPT_FILE, "r", encoding="utf-8") as f:
-            return f.read().strip()
-    return "あなたは日本語で会話する雑談アシスタントです。"
 
 
 def stream_chat(req):
@@ -129,8 +124,7 @@ def run_execute_and_wait(server_proc, instructions):
 
 
 def run_chat_loop(model_name, server_proc, log_path):
-    base_prompt = load_chat_prompt()
-    messages = [{"role": "system", "content": build_system_prompt_with_memory(base_prompt, BASE_DIR)}]
+    messages = [{"role": "system", "content": build_system_prompt_with_memory(ROLE["prompt"], BASE_DIR)}]
 
     print(f"\n[雑談役] {model_name} で起動しました。何でも話しかけてください。")
     print("※ 終了: 'exit'/'quit' / 送信: 新しい行で 'EOF' か Ctrl+Z/Ctrl+D\n")
@@ -179,7 +173,7 @@ def run_chat_loop(model_name, server_proc, log_path):
             payload = json.dumps({
                 "model": model_name,
                 "messages": messages,
-                "tools": CHAT_TOOLS,
+                "tools": ROLE["tools"],
                 "stream": True,
                 "keep_alive": KEEP_ALIVE,
                 "options": {"temperature": 0.6, "top_p": 0.9},

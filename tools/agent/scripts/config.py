@@ -13,15 +13,8 @@ OLLAMA_HOST = "http://127.0.0.1:11434"
 # アイドル時に VRAM を解放するまでの時間
 KEEP_ALIVE = "3m"
 
-# 雑談役(chat_agent.py)が使うモデル
-# [NOTE] 何度か入れ替えて検証した結果:
-#        - deepseek-r1:14b はhandoff_to_executeを確実に呼べなかった（言葉で説明するだけ）
-#        - llama3.1:8bはtool呼び出し自体は確実だが、逆に雑談("やぁ"等)にまで
-#          toolを呼んでしまう誤検知が温度を下げても直らなかった（tool_calls偏重の癖）
-#        - qwen2.5-coder:14bは、雑談には呼ばず・曖昧な依頼は聞き返し・明確な依頼は
-#          正しくhandoffする、と最もバランスが良かった（構造化tool_callsは返さないが
-#          tool_call_from_content()のフォールバックで拾える）。プロンプト強化後に確認。
-CHAT_MODEL = "qwen2.5-coder:14b"
+# [NOTE] 各役(chat/execute)が使うモデルは roles/<role>/role.json 側で定義する
+#        (scripts/role_loader.py)。モデル選定の経緯はREADME.md参照。
 
 # 各セッションの会話ログを置くディレクトリ名
 LOGS_DIRNAME = "logs"

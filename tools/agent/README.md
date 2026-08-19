@@ -13,11 +13,33 @@ GPU(VRAM)が1本しかないため、複数の役を同時には動かせない�
 ## 役(role)一覧
 
 「役」はモデルと初期プロンプト（＋使えるtool）の組み合わせに過ぎない。
+その定義は `roles/<role_id>/` ディレクトリに切り出してあり、コードではなく
+データ（`role.json` + `prompt.txt`）として持つ。
 
-| 役 | モジュール | モデル | できること |
-|----|-----------|--------|-----------|
-| 雑談役 (chat) | `chat_agent.py` | qwen2.5-coder:14b | 会話のみ。ファイル操作・コマンド実行は不可 |
-| Execute役 (execute) | `arc_agent.py` | 選択式（既定はqwen2.5-coder:14b） | コマンド実行・ファイル編集・共有メモ書き込み |
+| 役 | 定義 | 実行する側のモジュール | できること |
+|----|------|----------------------|-----------|
+| 雑談役 (chat) | `roles/chat/` | `chat_agent.py` | 会話のみ。ファイル操作・コマンド実行は不可 |
+| Execute役 (execute) | `roles/execute/` | `arc_agent.py` | コマンド実行・ファイル編集・共有メモ書き込み |
+
+### 新しい役を追加するには
+
+`roles/<role_id>/` に以下の2ファイルを置く。
+
+```
+roles/<role_id>/role.json    { "display_name": "...", "model": "...", "tools": ["read_file", "remember", ...] }
+roles/<role_id>/prompt.txt   システムプロンプト本文
+```
+
+`tools` に書けるのは `scripts/tools.py` の `TOOL_REGISTRY` に登録済みのtool名だけ
+（`scripts/role_loader.py` の `load_role()` が読み込み時に検証する）。
+
+[NOTE] これで役の「定義」（モデル・プロンプト・使えるtoolの一覧）はファイルだけで
+完結するが、その役を「実際に呼び出す」コード（今なら`chat_agent.py`が
+`arc_agent.start_interactive_chat()`を呼ぶ部分）は別途必要。
+tool呼び出しの実処理（`run_command`等）も`arc_agent.py`側の実装に依存しているため、
+全く新しい種類の役（例: 検索専用でファイル編集はしない役）を追加する場合は、
+`role.json`の`tools`を絞るだけで対応できるが、Execute系の実処理を使わない
+役を作る場合はコード側の対応が別途必要になる。
 
 起動はユーザーが `chat_agent.py` を実行するところから始まる:
 
@@ -116,7 +138,7 @@ Ollamaのtool calling（function calling）で実装している。モデルに�
 | `remember` | `note` | 共有メモに書き残す |
 | `return_to_chat` | `summary` | 作業完了。雑談役に会話を戻す（関数のreturn） |
 
-いずれも1返答につき1回だけ呼ぶ設計（`prompt.txt` / `chat_prompt.txt` で明示）。
+いずれも1返答につき1回だけ呼ぶ設計（各役の`roles/<role_id>/prompt.txt`で明示）。
 
 ---
 
@@ -141,7 +163,7 @@ Ollamaのtool calling（function calling）で実装している。モデルに�
   最もバランスが良かった。現在の既定モデル。
 
 Execute役の既定モデルも同じ qwen2.5-coder:14b（`MODELS["6"]`）。
-`prompt.txt` の手本セクションが「→ tool(args) を呼ぶ。」という擬似コード表記だった時は、
+`roles/execute/prompt.txt` の手本セクションが「→ tool(args) を呼ぶ。」という擬似コード表記だった時は、
 モデルがそれをそのまま文章として書き写すだけでtoolを呼ばない不具合があった。
 手本は「実際にtool呼び出し機能を使う」ことを明記し、コピー可能な疑似コードを避ける形に直した。
 
@@ -173,14 +195,20 @@ Execute役の既定モデルも同じ qwen2.5-coder:14b（`MODELS["6"]`）。
 
 ```
 tools/agent/
-├── chat_agent.py           雑談役 本体・プログラムの入口（ユーザーが起動するのはこれ）
-├── arc_agent.py             Execute役 本体（chat_agent.pyから直接importして呼ばれる）
-├── chat_prompt.txt          雑談役システムプロンプト
-├── prompt.txt                 Execute役システムプロンプト
+├── chat_agent.py            雑談役 本体・プログラムの入口（ユーザーが起動するのはこれ）
+├── arc_agent.py              Execute役 本体（chat_agent.pyから直接importして呼ばれる）
 ├── README.md                    このファイル
+├── roles/
+│   ├── chat/
+│   │   ├── role.json             雑談役の定義（モデル・使うtool名）
+│   │   └── prompt.txt            雑談役システムプロンプト
+│   └── execute/
+│       ├── role.json             Execute役の定義（モデル・使うtool名）
+│       └── prompt.txt            Execute役システムプロンプト
 └── scripts/
-    ├── config.py               定数（モデル名・ファイル名等）
+    ├── config.py               定数（ファイル名等）
     ├── ollama.py               Ollamaサーバーのライフサイクル管理（起動・停止・VRAM解放）
-    ├── tools.py                  tool定義とtool_calls⇔内部アクション形式の変換
+    ├── tools.py                  tool定義・TOOL_REGISTRY・tool_calls⇔内部アクション形式の変換
+    ├── role_loader.py            roles/ からの役の読み込み
     └── memory.py                 セッションログ・共有メモ(shared_memory.md)の読み書き
 ```

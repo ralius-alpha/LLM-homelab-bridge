@@ -35,7 +35,8 @@ from scripts.ollama import (
     run_server,
     warmup_model,
 )
-from scripts.tools import TOOLS, tool_calls_to_actions, tool_call_from_content, return_to_chat_from_tool_calls
+from scripts.tools import tool_calls_to_actions, tool_call_from_content, return_to_chat_from_tool_calls
+from scripts.role_loader import load_role
 from scripts.memory import (
     start_session_log,
     append_session_log,
@@ -47,7 +48,9 @@ from scripts.memory import (
 # 1. 動作・環境設定 (Intel Arc A770 最適化)
 # ==========================================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-PROMPT_FILE = os.path.join(BASE_DIR, "prompt.txt")
+ROLE_ID = "execute"
+ROLE = load_role(BASE_DIR, ROLE_ID)
+PROMPT_FILE = os.path.join(BASE_DIR, "roles", ROLE_ID, "prompt.txt")
 
 # ★ AIが実行するコマンドの作業ディレクトリ（cdが引き継がれない問題への物理的対策）
 #   起動時にユーザーが設定する。未設定なら BASE_DIR を使う。
@@ -114,22 +117,6 @@ class Spinner:
         return final
 
 
-def get_default_agent_prompt():
-    return r"""あなたはWindows PC上でコマンドとファイル編集を実行できる自律型CLIエージェントです。
-実行・編集・読み込みは、テキストのタグではなく、必ずtool呼び出し（execute_command / edit_file / read_file / remember / return_to_chat）で行う。
-ファイルを読むときは Get-Content ではなく read_file を使う（文字化けせず行番号付きで読める）。
-コード改造は全文書き換え禁止。必ず edit_file の search/replace で一部だけ直すこと。
-1回の返答でtool呼び出しは1個だけ。成功結果が返ってきたら同じ呼び出しを繰り返さない。
-作業がすべて完了したら return_to_chat を呼んで雑談役に会話を戻す。
-回答は日本語で。
-"""
-
-
-def load_system_prompt():
-    if os.path.exists(PROMPT_FILE):
-        with open(PROMPT_FILE, "r", encoding="utf-8") as f:
-            return f.read().strip()
-    return get_default_agent_prompt()
 
 
 def strip_think_blocks(text: str) -> str:
@@ -552,7 +539,7 @@ def start_interactive_chat(model_name: str, exec_mode: str, server_proc,
         print("[MODE] ログモード有効（生ストリーム＋会話ファイル保存）")
     print("※ 終了: 'exit'/'quit' / 送信: 新しい行で 'EOF' か Ctrl+Z/Ctrl+D\n")
 
-    messages = [{"role": "system", "content": build_system_prompt_with_memory(load_system_prompt(), BASE_DIR)}]
+    messages = [{"role": "system", "content": build_system_prompt_with_memory(ROLE["prompt"], BASE_DIR)}]
     print("[AI] 初期化が完了しました。質問をどうぞ。")
 
     MAX_AUTO_STEPS = 12
@@ -604,7 +591,7 @@ def start_interactive_chat(model_name: str, exec_mode: str, server_proc,
                 payload = json.dumps({
                     "model": model_name,
                     "messages": messages,
-                    "tools": TOOLS,
+                    "tools": ROLE["tools"],
                     "stream": True,
                     "keep_alive": KEEP_ALIVE,
                     "options": {
