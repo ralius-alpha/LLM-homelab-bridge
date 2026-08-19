@@ -35,7 +35,7 @@ from scripts.ollama import (
 from scripts.tools import (
     tool_calls_to_actions,
     tool_call_from_content,
-    return_to_chat_from_tool_calls,
+    return_to_caller_from_tool_calls,
     strip_think_blocks,
 )
 from scripts.display import stream_chat_response
@@ -324,19 +324,24 @@ def run_command(command: str, mode: str) -> str:
 def start_interactive_chat(model_name: str, exec_mode: str, server_proc,
                            debug_mode: bool = False, raw_dump: bool = False,
                            initial_message: str = None, is_nested: bool = False,
-                           num_ctx: int = 8192):
+                           num_ctx: int = 8192, log_path: str = None):
     """
     Execute役のセッション本体。
 
-    is_nested=True の場合、雑談役から直接呼び出されている（入れ子呼び出し）。
+    is_nested=True の場合、他の役から直接呼び出されている（入れ子呼び出し）。
     この場合は自分でOllamaサーバーを止めたりしない（呼び出し元と共有しているため）。
     代わりに、自分のモデルだけVRAMから解放してから、呼び出し元に制御を返す
-    （return_to_chatが呼ばれれば要約文字列を、それ以外の終了ならNoneを返す）。
+    （return_to_callerが呼ばれれば要約文字列を、それ以外の終了ならNoneを返す）。
 
     is_nested=False（単体起動時）は今まで通り、終了時にサーバーも止めて完全に片付ける。
+
+    log_path: 呼び出し元から共通のセッションログを渡された場合はそこに追記する
+    （役をまたいでも1つのログで会話の続きを追えるようにするため）。
+    未指定（単体起動時）なら自分で新しいログファイルを作る。
     """
     warmup_model(model_name)
-    log_path = start_session_log(BASE_DIR, "execute")
+    if log_path is None:
+        log_path = start_session_log(BASE_DIR, "execute")
 
     def teardown(summary=None):
         """呼び出し元に返す前の後片付け。nestedならモデル解放だけ、単体ならサーバーも止める。"""
@@ -457,12 +462,12 @@ def start_interactive_chat(model_name: str, exec_mode: str, server_proc,
 
                 effective_tool_calls = tool_calls or tool_call_from_content(strip_think_blocks(ai_response_full))
 
-                return_info = return_to_chat_from_tool_calls(effective_tool_calls)
+                return_info = return_to_caller_from_tool_calls(effective_tool_calls)
                 if return_info:
                     cleaned_up = True
                     if is_nested:
-                        print(f"\n[RETURN] 雑談役に会話を戻します。")
-                        append_session_log(log_path, "System", f"雑談役に戻る: {return_info['summary']}")
+                        print(f"\n[RETURN] 呼び出し元に会話を戻します。")
+                        append_session_log(log_path, "System", f"呼び出し元に戻る: {return_info['summary']}")
                         return teardown(return_info["summary"])
                     else:
                         print(f"\n[完了] {return_info['summary']}")
@@ -496,9 +501,9 @@ def start_interactive_chat(model_name: str, exec_mode: str, server_proc,
                     if is_nested:
                         # [IMPORTANT] ここでbreakして自分の入力待ちに戻ると、壊れた文脈のまま
                         # ユーザーの次の発言を処理してしまい、同じ暴走を繰り返す。
-                        # nested実行中なら、暴走を検知した時点で強制的に雑談役へ戻す。
-                        print("\n[RETURN] 暴走を検知したため、雑談役に会話を戻します。")
-                        append_session_log(log_path, "System", f"暴走検知により雑談役に戻る: {report}")
+                        # nested実行中なら、暴走を検知した時点で強制的に呼び出し元へ戻す。
+                        print("\n[RETURN] 暴走を検知したため、呼び出し元に会話を戻します。")
+                        append_session_log(log_path, "System", f"暴走検知により呼び出し元に戻る: {report}")
                         cleaned_up = True
                         return teardown(report or "同じ操作が繰り返されたため、途中で強制停止しました。")
                     break
@@ -542,8 +547,8 @@ def start_interactive_chat(model_name: str, exec_mode: str, server_proc,
                                        "出さず、ここまでに行った内容を日本語で簡潔に報告して終了してください。"
                         })
                         report = _final_report(messages, model_name, debug_mode, chat_log_file)
-                        print("\n[RETURN] 自動実行の上限に達したため、雑談役に会話を戻します。")
-                        append_session_log(log_path, "System", f"上限到達により雑談役に戻る: {report}")
+                        print("\n[RETURN] 自動実行の上限に達したため、呼び出し元に会話を戻します。")
+                        append_session_log(log_path, "System", f"上限到達により呼び出し元に戻る: {report}")
                         cleaned_up = True
                         return teardown(report or f"自動実行が上限({MAX_AUTO_STEPS}回)に達したため、途中で強制停止しました。")
                     break
@@ -563,7 +568,7 @@ def _final_report(messages, model_name, debug_mode, chat_log_file):
     """
     暴走停止後、最終報告を1回だけ生成させる（アクションは実行しない）。
     報告文字列を返す（失敗時はNone）。呼び出し元は、nested実行中ならこれを
-    そのままreturn_to_chatの要約として使い、雑談役に自動的に会話を戻す。
+    そのままreturn_to_callerの要約として使い、呼び出し元に自動的に会話を戻す。
     """
     payload = json.dumps({
         "model": model_name,
@@ -584,7 +589,7 @@ def _final_report(messages, model_name, debug_mode, chat_log_file):
                 f.write(f"\n[Final Report]\n{report}\n")
         # toolsを渡していない呼び出しだが、モデルがtool呼び出し風のJSONを
         # そのまま書いてしまうことがある。summaryが拾えればそちらを使う。
-        forced_return = return_to_chat_from_tool_calls(tool_call_from_content(report))
+        forced_return = return_to_caller_from_tool_calls(tool_call_from_content(report))
         if forced_return:
             return forced_return["summary"]
         return strip_think_blocks(report) or None
@@ -687,8 +692,8 @@ def _test_mode_launch(exec_mode, log_file):
 def main():
     """
     単体起動（例: python arc_agent.py）専用のメニュー駆動フロー。
-    雑談役から入れ子で呼ばれる時はこのmain()は通らず、
-    chat_agent.pyがstart_interactive_chat()を直接呼ぶ。
+    他の役から入れ子で呼ばれる時はこのmain()は通らず、
+    scripts.dispatch.invoke_role() がstart_interactive_chat()を直接呼ぶ。
     """
     global CURRENT_MODE, WORK_DIR
     log_file = os.path.join(BASE_DIR, "ollama_server.log")

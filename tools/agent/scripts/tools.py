@@ -39,13 +39,13 @@ REMEMBER_TOOL = {
     },
 }
 
-RETURN_TO_CHAT_TOOL = {
+RETURN_TO_CALLER_TOOL = {
     "type": "function",
     "function": {
-        "name": "return_to_chat",
+        "name": "return_to_caller",
         "description": (
             "依頼された作業が完了し、これ以上コマンド実行やファイル編集が不要になったと"
-            "判断した時に呼ぶ。雑談役に会話を戻す。作業の途中で呼ばないこと。"
+            "判断した時に呼ぶ。自分を呼び出した側に会話を戻す。作業の途中で呼ばないこと。"
         ),
         "parameters": {
             "type": "object",
@@ -54,7 +54,7 @@ RETURN_TO_CHAT_TOOL = {
                     "type": "string",
                     "description": (
                         "何をして、結果がどうなったかの要約。"
-                        "雑談役はこの会話の履歴を見られないため、これだけ読んで"
+                        "呼び出し元はこの会話の履歴を見られないため、これだけ読んで"
                         "ユーザーに説明できるように具体的に書くこと。"
                     ),
                 }
@@ -137,46 +137,62 @@ READ_FILE_TOOL = {
     },
 }
 
-HANDOFF_TO_EXECUTE_TOOL = {
-    "type": "function",
-    "function": {
-        "name": "handoff_to_execute",
-        "description": (
-            "会話だけでは対応できず、実際にファイルの読み書きやコマンド実行が"
-            "必要な作業だと判断した時に呼ぶ。Execute役はこの会話の履歴を見られないため、"
-            "instructionsには何をしてほしいかを、それだけ読んで分かるように具体的に書くこと。"
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "instructions": {
-                    "type": "string",
-                    "description": "Execute役への具体的な作業指示（会話の要点をまとめたもの）",
+def build_handoff_tool(targets):
+    """
+    handoff_to_role のtool定義を動的に作る。
+    targets: [{"role_id", "display_name", "specialty"}, ...]（role_loader.pyが
+    role.jsonの "can_handoff_to" から解決して渡す）。
+    role_idごとに専用のtoolを固定で持つのではなく、この1つのtoolに「誰を呼べるか」を
+    enumとして持たせることで、役が増えてもtools.py側の変更が不要になる。
+    """
+    role_id_lines = "\n".join(
+        f"- {t['role_id']}（{t['display_name']}）: {t['specialty']}" for t in targets
+    )
+    return {
+        "type": "function",
+        "function": {
+            "name": "handoff_to_role",
+            "description": (
+                "会話だけでは対応できない、自分の専門外の作業だと判断した時に呼ぶ。"
+                "呼び出し先はこの会話の履歴を直接は見られないため、instructionsには"
+                "何をしてほしいかを、それだけ読んで分かるように具体的に書くこと。\n"
+                f"引き継ぎ先の候補:\n{role_id_lines}"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "role_id": {
+                        "type": "string",
+                        "enum": [t["role_id"] for t in targets],
+                        "description": "引き継ぐ先の役のID",
+                    },
+                    "instructions": {
+                        "type": "string",
+                        "description": "引き継ぎ先への具体的な作業指示（会話の要点をまとめたもの）",
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "なぜ自分では対応できず引き継ぎが必要なのか",
+                    },
                 },
-                "reason": {
-                    "type": "string",
-                    "description": "なぜ雑談では対応できず引き継ぎが必要なのか",
-                },
+                "required": ["role_id", "instructions"],
             },
-            "required": ["instructions"],
         },
-    },
-}
+    }
+
 
 # 名前 → tool定義。roles/<role>/role.json が "tools": ["read_file", ...] のように
 # 名前だけでtoolを指定できるようにするための引き当て表（scripts/role_loader.pyが使う）。
+# [NOTE] handoff_to_role はここには無い。役ごとに「誰を呼べるか」が違う動的なtoolなので、
+#        role.jsonの "can_handoff_to" を見て role_loader.py が build_handoff_tool() で
+#        個別に組み立てる。
 TOOL_REGISTRY = {
     "remember": REMEMBER_TOOL,
-    "return_to_chat": RETURN_TO_CHAT_TOOL,
+    "return_to_caller": RETURN_TO_CALLER_TOOL,
     "execute_command": EXECUTE_COMMAND_TOOL,
     "edit_file": EDIT_FILE_TOOL,
     "read_file": READ_FILE_TOOL,
-    "handoff_to_execute": HANDOFF_TO_EXECUTE_TOOL,
 }
-
-TOOLS = [REMEMBER_TOOL, RETURN_TO_CHAT_TOOL, EXECUTE_COMMAND_TOOL, EDIT_FILE_TOOL, READ_FILE_TOOL]
-
-CHAT_TOOLS = [REMEMBER_TOOL, HANDOFF_TO_EXECUTE_TOOL]
 
 
 def strip_think_blocks(text: str) -> str:
@@ -284,10 +300,10 @@ def tool_call_from_content(text):
 
 
 def handoff_from_tool_calls(tool_calls):
-    """tool_callsからhandoff_to_executeの呼び出しを探し、{"instructions", "reason"}を返す。無ければNone。"""
+    """tool_callsからhandoff_to_roleの呼び出しを探し、{"role_id", "instructions", "reason"}を返す。無ければNone。"""
     for tc in tool_calls or []:
         fn = tc.get("function", {})
-        if fn.get("name") != "handoff_to_execute":
+        if fn.get("name") != "handoff_to_role":
             continue
         args = fn.get("arguments", {})
         if isinstance(args, str):
@@ -297,21 +313,24 @@ def handoff_from_tool_calls(tool_calls):
                 args = {}
         if not isinstance(args, dict):
             continue
+        role_id = args.get("role_id")
+        if not isinstance(role_id, str) or not role_id.strip():
+            continue
         instructions = args.get("instructions")
         if not isinstance(instructions, str) or not instructions.strip():
             continue
         reason = args.get("reason", "")
         if not isinstance(reason, str):
             reason = ""
-        return {"instructions": instructions, "reason": reason}
+        return {"role_id": role_id.strip(), "instructions": instructions, "reason": reason}
     return None
 
 
-def return_to_chat_from_tool_calls(tool_calls):
-    """tool_callsからreturn_to_chatの呼び出しを探し、{"summary"}を返す。無ければNone。"""
+def return_to_caller_from_tool_calls(tool_calls):
+    """tool_callsからreturn_to_callerの呼び出しを探し、{"summary"}を返す。無ければNone。"""
     for tc in tool_calls or []:
         fn = tc.get("function", {})
-        if fn.get("name") != "return_to_chat":
+        if fn.get("name") != "return_to_caller":
             continue
         args = fn.get("arguments", {})
         if isinstance(args, str):

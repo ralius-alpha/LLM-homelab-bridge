@@ -8,6 +8,12 @@ GPU(VRAM)が1本しかないため、複数の役を同時には動かせない�
 [NOTE] 実装の経緯・検証結果は [`planning/chat-history-summary.md`](../../planning/chat-history-summary.md)
 にも記録がある。本ドキュメントは現在の仕様のリファレンス。
 
+[設計目標] 役が増えても破綻しないこと。具体的には: (1) どの役からどの役へも
+共通の形（`handoff_to_role` / `return_to_caller`）で引き継げる、(2) 引き継ぎ先は
+実際の直近の会話を受け取れる、(3) 役をまたいでも1つの共通ログで会話の続きが追える、
+(4) 各役は自分の専門性を認識し、専門外は無理に自分でやろうとせず適切な役に
+任せる、の4点。詳細は「新しい役を追加するには」を参照。
+
 ---
 
 ## 役(role)一覧
@@ -26,20 +32,56 @@ GPU(VRAM)が1本しかないため、複数の役を同時には動かせない�
 `roles/<role_id>/` に以下の2ファイルを置く。
 
 ```
-roles/<role_id>/role.json    { "display_name": "...", "model": "...", "tools": ["read_file", "remember", ...] }
+roles/<role_id>/role.json
+{
+  "display_name": "...",
+  "specialty": "この役の専門性（1行）。handoff_to_roleの説明文と、自分自身への
+                自己認識プロンプトの両方に自動で使われる。",
+  "model": "...",
+  "tools": ["read_file", "remember", ...],
+  "can_handoff_to": ["execute", ...],   // 他の役に引き継げるなら列挙。無ければ省略可
+  "module": "some_role_module"          // 引き継ぎ先として呼ばれる役だけ必要（後述）
+}
+
 roles/<role_id>/prompt.txt   システムプロンプト本文
 ```
 
 `tools` に書けるのは `scripts/tools.py` の `TOOL_REGISTRY` に登録済みのtool名だけ
 （`scripts/role_loader.py` の `load_role()` が読み込み時に検証する）。
+`handoff_to_role` はここには書かない。`can_handoff_to` を書くと自動的に付与される
+（後述）。
 
-[NOTE] これで役の「定義」（モデル・プロンプト・使えるtoolの一覧）はファイルだけで
-完結するが、その役を「実際に呼び出す」コード（今なら`chat_agent.py`が
-`arc_agent.start_interactive_chat()`を呼ぶ部分）は別途必要。
-tool呼び出しの実処理（`run_command`等）も`arc_agent.py`側の実装に依存しているため、
-全く新しい種類の役（例: 検索専用でファイル編集はしない役）を追加する場合は、
-`role.json`の`tools`を絞るだけで対応できるが、Execute系の実処理を使わない
-役を作る場合はコード側の対応が別途必要になる。
+[NOTE] 役の「定義」（モデル・プロンプト・使えるtool・引き継ぎ先・専門性）はファイル
+だけで完結する。ただし tool呼び出しの実処理（`run_command`等）は実装コード側に依存
+するため、既存のExecute役と全く違う種類の役（例: Web検索専用でファイル編集はしない
+役）を追加する場合は、その役自身の実装（Pythonモジュール）を書く必要がある。
+
+#### 引き継ぎ（handoff）は role_id 名指しではなく共通の形
+
+役Aの `role.json` に `"can_handoff_to": ["execute", "review"]` と書くと、
+`scripts/role_loader.py` が自動的に `handoff_to_role` という1つのtool
+（`role_id` はenumで `execute`/`review` に制限される）をAのtool一覧に追加し、
+Aのプロンプトの末尾にも「自分の専門性はこれ、それ以外はこの役に引き継げ」という
+自己認識ブロックを自動で注入する。これにより：
+
+- 呼び出す側（chat_agent.py等）は `handoff_to_role` という1つのtool呼び出しだけを
+  見ればよく、`handoff_to_execute` のような役名固定のtoolを役の数だけ増やす必要が無い。
+- 引き継ぎ先の実際の起動は `scripts/dispatch.py` の `invoke_role(base_dir, role_id, ...)`
+  が担う。`role.json` の `"module"` を見て `importlib` でそのモジュールを動的に
+  importし、`"entry"`（省略時は `start_interactive_chat`）という名前の関数を
+  共通のシグネチャで呼ぶ。呼び出し元のコード（`chat_agent.py`）は、どの役を
+  呼ぶ時も同じ`invoke_role()`しか使わないため、新しい役を追加してもこのファイルは
+  変更不要（`roles/<role_id>/role.json`の`can_handoff_to`に追記するだけでよい）。
+- 引き継ぎ先として呼ばれる役の実装は、次の契約を満たす関数を公開すること:
+  ```python
+  def start_interactive_chat(model_name, exec_mode, server_proc, *,
+                              initial_message=None, is_nested=False,
+                              log_path=None, **kwargs): ...
+  # 戻り値: return_to_callerが呼ばれれば要約文字列、それ以外の終了ならNone
+  ```
+- 戻る側も `return_to_caller`（引数`summary`のみ）という1つのtoolに統一されている。
+  「雑談役に戻る」という名前ではなく「呼び出し元に戻る」なので、将来Execute役以外の
+  役からExecute役を呼ぶケースが増えても意味が破綻しない。
 
 [NOTE] ストリーム応答の表示（点字スピナー・「思考中」→「出力中」のラベル切り替え・
 トークン数表示）は`scripts/display.py`の`stream_chat_response()`に共通化してあり、
@@ -71,25 +113,27 @@ python chat_agent.py
 main() in chat_agent.py
   └─ run_chat_loop()                       ← 雑談役。ユーザーと直接対話する
        │  ユーザーの要望が実作業を要すると判断
-       │  handoff_to_execute が呼ばれる
+       │  handoff_to_role(role_id="execute") が呼ばれる
+       │  直近の会話の抜粋（要約ではなく実データ）を instructions に添えて渡す
        ▼
-     run_execute_and_wait()
+     run_role_and_wait() → scripts.dispatch.invoke_role()
        │  自分(雑談役)のモデルをVRAMから解放
+       │  role.jsonの"module"を見てimportlibで動的import
        ▼
-     arc_agent.start_interactive_chat(is_nested=True)   ← Execute役。ここも同じプロセス
-       │  コマンド実行・ファイル編集を行う
+     arc_agent.start_interactive_chat(is_nested=True, log_path=共通ログ)  ← Execute役。同じプロセス
+       │  コマンド実行・ファイル編集を行う（雑談役と同じログファイルに追記）
        │  作業完了と判断
-       │  return_to_chat が呼ばれる → 要約文字列を return
+       │  return_to_caller が呼ばれる → 要約文字列を return
        ▼
-     run_execute_and_wait() に戻ってくる
+     invoke_role() に戻ってくる
        │  Execute役のモデルは自分の中でVRAM解放済み
        │  雑談役のモデルを再ロード
        ▼
      run_chat_loop() の続きに戻る            ← 要約を会話に注入して雑談続行
 ```
 
-`arc_agent.start_interactive_chat()` は普通のPython関数で、呼ばれたら実行し、
-終わったら（`return_to_chat` が呼ばれるか、単に終了すれば）呼び出し元に戻ってくる。
+引き継ぎ先の`start_interactive_chat()`は普通のPython関数で、呼ばれたら実行し、
+終わったら（`return_to_caller` が呼ばれるか、単に終了すれば）呼び出し元に戻ってくる。
 別プロセスを起動することも、何かを `kill` することも一切ない。
 
 ### なぜプロセスを分けず、この形にしたか
@@ -117,10 +161,21 @@ main() in chat_agent.py
 | ファイル | 役割 | 寿命 |
 |---------|------|------|
 | `shared_memory.md` | 全役共通の「忘れてはいけない事項」。追記型 | 永続（消えない。ユーザーが直接編集してもよい） |
-| `logs/{role}_{timestamp}.log` | セッションごとの会話ログ。ターンごとに逐次追記 | 永続（古いものは手動で整理する想定） |
+| `logs/{role}_{timestamp}.log` | セッション全体の会話ログ。ターンごとに逐次追記 | 永続（古いものは手動で整理する想定） |
 
 役の切り替え自体はプロセス内の関数呼び出しなので、以前あった `active_role.json`
 （PID記録）や `relay.json`（引き継ぎメッセージ）は不要になり廃止した。
+
+[NOTE] ログファイルは役ごとではなく、**トップレベルのセッション単位で1つ**。
+`chat_agent.main()` が最初に1回 `start_session_log()` で作ったログファイルの
+パス(`log_path`)を、引き継ぎのたびに `invoke_role()` → 引き継ぎ先の
+`start_interactive_chat(..., log_path=...)` へそのまま渡し、引き継ぎ先も同じ
+ファイルに追記する。以前は役ごとに別ファイル（`chat_*.log`と`execute_*.log`が
+別々）だったため、雑談役に戻った時に何が起きたかを追うには2つのファイルを
+タイムスタンプで突き合わせる必要があったが、今は1ファイルで完結する。
+`scripts/memory.py`の`append_role_transition()`が引き継ぎ/復帰のたびに
+`=== 引き継ぎ: chat → execute ===` / `=== 復帰: execute → chat ===` という
+区切りをログに書き込むため、ファイルを開くだけで会話の続きが追える。
 
 ---
 
@@ -133,14 +188,22 @@ Ollamaのtool calling（function calling）で実装している。モデルに�
 見つかった有効なものを全て抽出する（最初の1個だけを取り出す実装だと、2個以上並んだ時に
 まとめて壊れたJSONとして読めてしまい、両方とも無視される不具合があった）。
 
-### 雑談役 (`CHAT_TOOLS`)
+### 役をまたいで共通のtool（`can_handoff_to`があれば自動付与）
 
 | tool | 引数 | 用途 |
 |------|------|------|
-| `handoff_to_execute` | `instructions`, `reason` | Execute役を呼び出す |
+| `handoff_to_role` | `role_id`, `instructions`, `reason` | 指定した役を呼び出す（`role_id`は自分の`can_handoff_to`の範囲にenumで制限される） |
+| `return_to_caller` | `summary` | 作業完了。自分を呼び出した側に会話を戻す（関数のreturn） |
 | `remember` | `note` | 共有メモに書き残す |
 
-### Execute役 (`TOOLS`)
+### 雑談役固有
+
+| tool | 引数 | 用途 |
+|------|------|------|
+| `handoff_to_role` | `role_id="execute"`, `instructions`, `reason` | `roles/chat/role.json`の`can_handoff_to`が`["execute"]`なので実質Execute役限定 |
+| `remember` | `note` | 共有メモに書き残す |
+
+### Execute役固有
 
 | tool | 引数 | 用途 |
 |------|------|------|
@@ -148,7 +211,7 @@ Ollamaのtool calling（function calling）で実装している。モデルに�
 | `edit_file` | `file`, `search`, `replace` | SEARCH/REPLACE形式のピンポイント編集 |
 | `read_file` | `file` | ファイルを行番号付きで読む（文字化け対策） |
 | `remember` | `note` | 共有メモに書き残す |
-| `return_to_chat` | `summary` | 作業完了。雑談役に会話を戻す（関数のreturn） |
+| `return_to_caller` | `summary` | 作業完了。呼び出し元に会話を戻す（関数のreturn） |
 
 いずれも1返答につき1回だけ呼ぶ設計（各役の`roles/<role_id>/prompt.txt`で明示）。
 
@@ -160,27 +223,32 @@ Ollamaのtool calling（function calling）で実装している。モデルに�
 
 雑談役のモデルは複数回入れ替えて検証した:
 
-- **deepseek-r1:14b**: `handoff_to_execute` を実際には呼ばず、言葉で「引き継ぎます」と
-  説明するだけで終わることが3回中3回発生。判断はできているが、tool呼び出しという
-  手続きに変換できていなかった。
+- **deepseek-r1:14b**: `handoff_to_execute`（旧tool名）を実際には呼ばず、言葉で
+  「引き継ぎます」と説明するだけで終わることが3回中3回発生。判断はできているが、
+  tool呼び出しという手続きに変換できていなかった。
 - **llama3.1:8b**: tool呼び出し自体は構造化`tool_calls`で確実に返る。しかし
   「やぁ」のような雑談にまでtoolを呼んでしまう誤検知が、temperatureを0まで
   下げても直らなかった（tools有りだと何か呼ばなければと思い込む癖）。
-  toolを1個(`handoff_to_execute`のみ)に絞っても改善せず、むしろ全メッセージで
-  誤発火するようになり悪化した。
+  toolを1個に絞っても改善せず、むしろ全メッセージで誤発火するようになり悪化した。
 - **qwen2.5-coder:14b**: 構造化`tool_calls`は返さないが、`tool_call_from_content()`の
   フォールバックで拾える形のJSONを出す。プロンプトを強化（「toolは例外処理」
   「rememberは価値ある事実がある時だけ」を明記）した上で検証したところ、
   雑談には反応せず・曖昧な依頼は聞き返し・明確な依頼は正しく引き継ぐ、と
   最もバランスが良かった。現在の既定モデル。
 
-Execute役の既定モデルも同じ qwen2.5-coder:14b（`MODELS["6"]`）。
+Execute役の既定モデルも同じ qwen2.5-coder:14b。これは `roles/execute/role.json`の
+`"model"`が唯一の情報源で、引き継ぎ時に使うモデルも`scripts.dispatch.invoke_role()`が
+そこから読む。
+[NOTE] 以前は`chat_agent.py`が引き継ぎ先のモデルを`scripts.config.MODELS["6"]`という
+別の決め打ちから取っており、`roles/execute/role.json`の`"model"`を書き換えても
+実際の引き継ぎ先モデルは変わらないという不整合があった（役の定義が2箇所に分かれていた）。
+`invoke_role()`が`role.json`だけを見るようにして解消した。
 `roles/execute/prompt.txt` の手本セクションが「→ tool(args) を呼ぶ。」という擬似コード表記だった時は、
 モデルがそれをそのまま文章として書き写すだけでtoolを呼ばない不具合があった。
 手本は「実際にtool呼び出し機能を使う」ことを明記し、コピー可能な疑似コードを避ける形に直した。
 
 [WARNING] 小型ローカルモデルは判断を誤ることがある（例: 相対パスでのファイル読み込みに
-1回失敗しただけで「ファイルが存在しない」と誤った結論をremember/return_to_chatに
+1回失敗しただけで「ファイルが存在しない」と誤った結論をremember/return_to_callerに
 書いてしまうケースを確認済み）。共有メモや報告内容は鵜呑みにせず、重要な判断は
 ユーザー自身で確認すること。
 
@@ -208,20 +276,21 @@ Execute役の既定モデルも同じ qwen2.5-coder:14b（`MODELS["6"]`）。
 ```
 tools/agent/
 ├── chat_agent.py            雑談役 本体・プログラムの入口（ユーザーが起動するのはこれ）
-├── arc_agent.py              Execute役 本体（chat_agent.pyから直接importして呼ばれる）
+├── arc_agent.py              Execute役 本体（scripts.dispatch経由で動的に呼ばれる）
 ├── README.md                    このファイル
 ├── roles/
 │   ├── chat/
-│   │   ├── role.json             雑談役の定義（モデル・使うtool名）
+│   │   ├── role.json             雑談役の定義（モデル・専門性・使うtool名・引き継ぎ先）
 │   │   └── prompt.txt            雑談役システムプロンプト
 │   └── execute/
-│       ├── role.json             Execute役の定義（モデル・使うtool名）
+│       ├── role.json             Execute役の定義（モデル・専門性・使うtool名・実装module）
 │       └── prompt.txt            Execute役システムプロンプト
 └── scripts/
     ├── config.py               定数（ファイル名等）
     ├── ollama.py               Ollamaサーバーのライフサイクル管理（起動・停止・VRAM解放）
     ├── tools.py                  tool定義・TOOL_REGISTRY・tool_calls⇔内部アクション形式の変換
     ├── display.py                 ストリーム応答の表示（Spinner・思考中/出力中表示）。役をまたいで共通
-    ├── role_loader.py            roles/ からの役の読み込み
+    ├── role_loader.py            roles/ からの役の読み込み。専門性・引き継ぎ先の解決も担う
+    ├── dispatch.py                役の入れ子呼び出しの共通化（role.jsonの"module"を動的import）
     └── memory.py                 セッションログ・共有メモ(shared_memory.md)の読み書き
 ```

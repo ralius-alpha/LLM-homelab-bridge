@@ -40,6 +40,20 @@ def append_session_log(log_path, label, text):
         print(f"[WARN] セッションログの書き込みに失敗しました: {e}")
 
 
+def append_role_transition(log_path, kind, from_role, to_role, detail=""):
+    """
+    役の引き継ぎ/復帰を、共通のログに記録する。
+    [NOTE] 引き継ぎ先も同じlog_pathに書き込むことで、1つのファイルを読めば
+           役をまたいだ会話の続きが分かるようにしている（役ごとに別ファイルだと、
+           前の役に戻った時に何が起きたかを追うのにファイルを跨がなければならない）。
+    """
+    label = "引き継ぎ" if kind == "handoff" else "復帰"
+    text = f"=== {label}: {from_role} → {to_role} ==="
+    if detail:
+        text += f"\n{detail}"
+    append_session_log(log_path, "System", text)
+
+
 def _shared_memory_path(base_dir):
     return os.path.join(base_dir, SHARED_MEMORY_FILENAME)
 

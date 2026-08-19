@@ -3,10 +3,10 @@
 雑談役エージェント。プログラムの入口（ユーザーが起動するのはこのスクリプト）。
 
 ファイル操作・コマンド実行はできない、会話専用のフロントエンド。
-会話だけでは対応できない要望を検知したら、handoff_to_executeでExecute役
-(arc_agent.start_interactive_chat)を直接呼び出す。Execute役が作業を終えたら
-（return_to_chatを呼ぶか、単に終了すれば）、その呼び出しがreturnして
-自分の会話ループにそのまま戻ってくる。
+会話だけでは対応できない要望を検知したら、handoff_to_roleで適切な役
+（roles/<id>/role.json の "module" が指す実装）を scripts.dispatch.invoke_role
+経由で呼び出す。呼び出された役が作業を終えたら（return_to_callerを呼ぶか、
+単に終了すれば）、その呼び出しがreturnして自分の会話ループにそのまま戻ってくる。
 
 [設計方針] 「役」はモデルと初期プロンプトの組み合わせに過ぎず、役の切り替えは
 プロセスを跨いだ引き継ぎではなく、ただの関数呼び出し（入れ子構造）でよい。
@@ -17,6 +17,10 @@
     「起動したはずが失敗する」という事故そのものが起こり得ない。
   - Ollamaサーバー自体はプログラム全体で1回だけ起動し、役の切り替えのたびに
     落として立て直したりしない（モデルの load/unload だけを行う）。
+  - 呼び出し先の特定は roles/<id>/role.json の "module" を見て動的にimportする
+    （scripts.dispatch.invoke_role）ため、新しい役を追加してもこのファイルは
+    変更不要。呼び出せる役の一覧は roles/chat/role.json の "can_handoff_to" が
+    決める。
 """
 
 import os
@@ -25,8 +29,7 @@ import json
 import urllib.request
 import urllib.error
 
-import arc_agent
-from scripts.config import OLLAMA_HOST, KEEP_ALIVE, MODELS
+from scripts.config import OLLAMA_HOST, KEEP_ALIVE
 from scripts.ollama import (
     setup_environment,
     cleanup_processes,
@@ -43,9 +46,11 @@ from scripts.tools import (
 )
 from scripts.display import stream_chat_response
 from scripts.role_loader import load_role
+from scripts.dispatch import invoke_role
 from scripts.memory import (
     start_session_log,
     append_session_log,
+    append_role_transition,
     append_shared_memory,
     build_system_prompt_with_memory,
 )
@@ -60,30 +65,40 @@ ROLE_ID = "chat"
 ROLE = load_role(BASE_DIR, ROLE_ID)
 CHAT_MODEL = ROLE["model"]
 
-# Execute役に引き継ぐ時の既定モデル（Qwen2.5-Coder 14B・推奨）
-EXECUTE_DEFAULT_MODEL_KEY = "6"
 
-
-def run_execute_and_wait(server_proc, instructions):
+def run_role_and_wait(server_proc, role_id, instructions, log_path):
     """
-    Execute役を直接呼び出し（入れ子）、終わるまで待つ。
-    自分のモデルをアンロードしてから呼び、戻ってきたら自分のモデルを再ロードする。
-    Execute役が例外で落ちても、ここで捕まえて会話は継続させる。
-    戻り値: Execute役からの報告（要約文字列）。無ければNone。
+    role_idの役を invoke_role 経由で入れ子呼び出しし、終わるまで待つ。
+    戻ってきたら自分(雑談役)のモデルを再ロードする。
+    呼び出し先が例外で落ちても、ここで捕まえて会話は継続させる。
+    戻り値: 呼び出し先からの報告（要約文字列）。無ければNone。
     """
-    _, exec_model_name = MODELS[EXECUTE_DEFAULT_MODEL_KEY]
-    unload_all_models()
     try:
-        summary = arc_agent.start_interactive_chat(
-            exec_model_name, "safe", server_proc,
-            initial_message=instructions, is_nested=True,
-        )
+        summary = invoke_role(BASE_DIR, role_id, server_proc, instructions, log_path)
     except Exception as e:
-        print(f"\n[ERROR] Execute役の実行中に問題が発生しました: {e}")
-        summary = f"Execute役の実行中にエラーが発生し、中断しました: {e}"
+        print(f"\n[ERROR] {role_id}役の実行中に問題が発生しました: {e}")
+        summary = f"{role_id}役の実行中にエラーが発生し、中断しました: {e}"
     finally:
         warmup_model(CHAT_MODEL)
     return summary
+
+
+def _render_recent_turns(messages, limit=6):
+    """
+    直近のuser/assistantの発言を、引き継ぎ先に渡す会話の参考情報として整形する。
+    [NOTE] 以前は instructions（呼び出し元モデルが作った要約）だけを渡しており、
+           実際の会話そのものは引き継ぎ先から一切見えなかった。要約は捏造や
+           抜け漏れが起こりうるため、実データである直近の会話も併せて渡す。
+    """
+    turns = [m for m in messages if m.get("role") in ("user", "assistant") and m.get("content")]
+    recent = turns[-limit:]
+    lines = []
+    for m in recent:
+        speaker = "ユーザー" if m["role"] == "user" else "雑談役"
+        text = strip_think_blocks(m["content"])
+        if text:
+            lines.append(f"{speaker}: {text}")
+    return "\n".join(lines)
 
 
 def run_chat_loop(model_name, server_proc, log_path):
@@ -164,15 +179,25 @@ def run_chat_loop(model_name, server_proc, log_path):
 
             handoff = handoff_from_tool_calls(effective_tool_calls)
             if handoff:
-                print(f"\n[HANDOFF] Execute役を呼び出します。理由: {handoff.get('reason') or '(不明)'}")
-                append_session_log(log_path, "System", f"引き継ぎ指示: {handoff['instructions']}")
+                role_id = handoff["role_id"]
+                print(f"\n[HANDOFF] {role_id}役を呼び出します。理由: {handoff.get('reason') or '(不明)'}")
+                append_role_transition(
+                    log_path, "handoff", "chat", role_id,
+                    f"理由: {handoff.get('reason') or '(不明)'}\n指示: {handoff['instructions']}",
+                )
 
-                summary = run_execute_and_wait(server_proc, handoff["instructions"])
+                context = _render_recent_turns(messages)
+                full_instructions = (
+                    f"[直前までの会話の抜粋（参考。要約ではなく実際のやり取り）]\n{context}\n\n"
+                    f"[今回の具体的な作業指示]\n{handoff['instructions']}"
+                ) if context else handoff["instructions"]
 
+                summary = run_role_and_wait(server_proc, role_id, full_instructions, log_path)
+
+                append_role_transition(log_path, "return", role_id, "chat", summary or "(報告なし)")
                 if summary:
-                    note = f"[Execute役からの報告]\n{summary}"
+                    note = f"[{role_id}役からの報告]\n{summary}"
                     messages.append({"role": "tool", "content": note})
-                    append_session_log(log_path, "System", note)
                     print(f"\n{note}\n")
                 continue
 
