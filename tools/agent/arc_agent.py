@@ -208,6 +208,62 @@ def run_edit(edit, mode):
         return msg
 
 
+def run_write(write_args, mode):
+    """
+    新規ファイルの作成、または既存ファイルの全文書き換え。
+    edit_fileはSEARCH/REPLACEで既存ファイルの一部だけを直すためのものだが、
+    真っ新なファイルを作る手段がこれまで無く、prompt側の「Copy-Itemで空の
+    ファイルを作ってからedit_fileで書く」という回りくどい手順に頼っていた。
+    write_fileは指定した内容をそのまま書き込む。既存ファイルを上書きする
+    場合は必ずバックアップを取る（edit_fileと同じ安全策）。
+    """
+    file_path = write_args["file"]
+    content = write_args["content"]
+    exists = os.path.exists(file_path)
+    action_label = "上書き" if exists else "新規作成"
+    print(f"\n[WRITE REQUESTED] 対象: {file_path} ({action_label})")
+
+    # 書き込みは「不可逆(変更系)」操作。edit_fileと同じ承認ルール。
+    op_type_str = "不可逆(変更/編集系)"
+    need_approval = False
+    if mode == "strict":
+        need_approval = True
+    elif mode == "safe":
+        need_approval = True
+    # full の場合は need_approval = False のまま（自動実行）
+
+    if need_approval:
+        raw = input(f"この {op_type_str} 書き込み（{action_label}）を実行しますか？ (y/n / 拒否理由コメント): ").strip()
+        val = unicodedata.normalize('NFKC', raw).lower()
+
+        if val == 'y':
+            pass  # 実行へ
+        elif val == 'n' or val == '':
+            print("[API NOTICE] 実行が拒否されました。")
+            return "[SYSTEM NOTICE] ユーザーによってファイル書き込みが拒否されました。"
+        else:
+            print(f"[API NOTICE] 実行が拒否されました (コメント: {raw})")
+            return f"[SYSTEM NOTICE] ユーザーによってファイル書き込みが拒否されました。拒否理由/指示: {raw}"
+
+    try:
+        if exists:
+            shutil.copy2(file_path, file_path + ".bak")
+        else:
+            parent = os.path.dirname(file_path)
+            if parent and not os.path.exists(parent):
+                os.makedirs(parent, exist_ok=True)
+        with open(file_path, "w", encoding="utf-8") as f:
+            f.write(content)
+        backup_note = f"（バックアップ: {os.path.basename(file_path)}.bak）" if exists else ""
+        msg = f"[WRITE OK] {file_path}: {action_label}しました{backup_note}"
+        print(msg)
+        return msg
+    except Exception as ex:
+        msg = f"[WRITE ERROR] 書き込み失敗 {file_path}: {ex}"
+        print(msg)
+        return msg
+
+
 def run_read(read):
     """ファイルをPythonがUTF-8で直接読み、行番号付きで返す（PowerShell経由の文字化けを回避）。"""
     file_path = read["file"]
@@ -565,6 +621,9 @@ def start_interactive_chat(model_name: str, exec_mode: str, server_proc,
                         feedback_parts.append(f"[SYSTEM COMMAND OUTPUT for '{act['content']}']\n{res}")
                     elif act["type"] == "edit":
                         res = run_edit(act, exec_mode)
+                        feedback_parts.append(res)
+                    elif act["type"] == "write":
+                        res = run_write(act, exec_mode)
                         feedback_parts.append(res)
                     elif act["type"] == "read":
                         res = run_read(act)

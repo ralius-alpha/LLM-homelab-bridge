@@ -254,7 +254,8 @@ Ollamaのtool calling（function calling）で実装している。モデルに�
 | tool | 引数 | 用途 |
 |------|------|------|
 | `execute_command` | `command` | PowerShellコマンドを1つ実行 |
-| `edit_file` | `file`, `search`, `replace` | SEARCH/REPLACE形式のピンポイント編集 |
+| `edit_file` | `file`, `search`, `replace` | SEARCH/REPLACE形式のピンポイント編集（既存ファイルの一部を直す） |
+| `write_file` | `file`, `content` | 新規ファイル作成、または全文書き換え（上書き時は自動バックアップ） |
 | `read_file` | `file` | ファイルを行番号付きで読む（文字化け対策） |
 | `search_web` | `query` | インターネット検索（スキル） |
 | `fetch_url` | `url` | 指定URLの本文を取得（スキル） |

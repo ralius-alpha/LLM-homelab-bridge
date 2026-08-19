@@ -115,6 +115,33 @@ EDIT_FILE_TOOL = {
     },
 }
 
+WRITE_FILE_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "write_file",
+        "description": (
+            "新しいファイルを作成する、または既存ファイルを全文書き換えする。"
+            "既存ファイルの一部だけを直す時は必ずedit_fileを使うこと（write_fileでの"
+            "全文書き換えは既存ファイルには使わない）。write_fileは主に「まだ存在しない"
+            "ファイルを新規作成する」時に使う。既存ファイルを上書きする場合はバックアップを取る。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "file": {
+                    "type": "string",
+                    "description": "作成/上書きするファイルの実際のパス",
+                },
+                "content": {
+                    "type": "string",
+                    "description": "書き込む内容（ファイルの中身そのもの、全文）",
+                },
+            },
+            "required": ["file", "content"],
+        },
+    },
+}
+
 READ_FILE_TOOL = {
     "type": "function",
     "function": {
@@ -297,6 +324,7 @@ TOOL_REGISTRY = {
     "return_to_caller": RETURN_TO_CALLER_TOOL,
     "execute_command": EXECUTE_COMMAND_TOOL,
     "edit_file": EDIT_FILE_TOOL,
+    "write_file": WRITE_FILE_TOOL,
     "read_file": READ_FILE_TOOL,
     "search_web": SEARCH_WEB_TOOL,
     "fetch_url": FETCH_URL_TOOL,
@@ -341,6 +369,14 @@ def tool_calls_to_actions(tool_calls):
                     "file": args["file"],
                     "search": args["search"],
                     "replace": args["replace"],
+                })
+
+        elif name == "write_file":
+            if all(k in args for k in ("file", "content")):
+                actions.append({
+                    "type": "write",
+                    "file": args["file"],
+                    "content": args["content"],
                 })
 
         elif name == "read_file":
