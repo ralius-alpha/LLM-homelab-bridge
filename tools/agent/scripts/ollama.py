@@ -141,6 +141,22 @@ def run_server(log_file):
     return server_proc
 
 
+def list_installed_models():
+    """
+    実際にインストール済み(pull済み)のモデル名一覧を Ollama から取得する。
+    scripts.config.MODELS は決め打ちのメニューなので、実機に入っていない
+    モデルも並んでしまう。テスト目的で実在するものだけを見たい時に使う。
+    取得できなければ空リストを返す。
+    """
+    try:
+        req = urllib.request.Request(f"{OLLAMA_HOST}/api/tags")
+        with urllib.request.urlopen(req, timeout=5) as res:
+            data = json.loads(res.read().decode("utf-8"))
+        return [m["name"] for m in data.get("models", []) if m.get("name")]
+    except Exception:
+        return []
+
+
 def warmup_model(model_name):
     print("[INFO] 初期プロンプト注入中...")
     time.sleep(0.5)

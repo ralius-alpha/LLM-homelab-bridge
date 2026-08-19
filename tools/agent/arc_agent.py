@@ -34,6 +34,7 @@ from scripts.ollama import (
     wait_for_server,
     run_server,
     warmup_model,
+    list_installed_models,
 )
 from scripts.tools import tool_calls_to_actions, tool_call_from_content, return_to_chat_from_tool_calls
 from scripts.role_loader import load_role
@@ -495,7 +496,8 @@ def stream_chat_response(req, debug_mode: bool, raw_dump: bool = False):
 # ==========================================
 def start_interactive_chat(model_name: str, exec_mode: str, server_proc,
                            debug_mode: bool = False, raw_dump: bool = False,
-                           initial_message: str = None, is_nested: bool = False):
+                           initial_message: str = None, is_nested: bool = False,
+                           num_ctx: int = 8192):
     """
     Execute役のセッション本体。
 
@@ -533,6 +535,7 @@ def start_interactive_chat(model_name: str, exec_mode: str, server_proc,
     print(f"[MODE] 実行承認モード: {EXEC_MODES[exec_mode]}")
     print(f"[WORK_DIR] コマンド実行ディレクトリ: {WORK_DIR}")
     print(f"[KEEP_ALIVE] アイドル {KEEP_ALIVE} で自動的にVRAMを解放します。")
+    print(f"[CONTEXT] num_ctx = {num_ctx}")
     if raw_dump:
         print("[MODE] 生ダンプモード有効（フィールド切り替え式・都度出力）")
     elif debug_mode:
@@ -595,7 +598,7 @@ def start_interactive_chat(model_name: str, exec_mode: str, server_proc,
                     "stream": True,
                     "keep_alive": KEEP_ALIVE,
                     "options": {
-                        "num_ctx": 8192,
+                        "num_ctx": num_ctx,
                         "temperature": 0.2,
                         "top_p": 0.9,
                         "repeat_penalty": 1.15
@@ -818,6 +821,42 @@ def _select_model_and_run(exec_mode, log_file, debug_mode, raw_dump, header):
     input("\nメニューに戻るには何かキーを押してください...")
 
 
+def _test_mode_launch(exec_mode, log_file):
+    """
+    テスト用起動: scripts.config.MODELSの決め打ちリストではなく、
+    実際にOllamaへpull済みのモデルを一覧して選ばせる。
+    num_ctx（コンテキスト長）も自由に指定できる。
+    """
+    print("\n--- テストモード起動 ---")
+    server_proc = run_server(log_file)
+
+    models = list_installed_models()
+    if not models:
+        print("[WARN] インストール済みモデルを取得できませんでした。メニューに戻ります。")
+        input("\nメニューに戻るには何かキーを押してください...")
+        return
+
+    print("インストール済みモデル:")
+    for i, name in enumerate(models, 1):
+        print(f" [{i}] {name}")
+    raw_choice = unicodedata.normalize('NFKC', input("番号、またはモデル名を直接入力: ").strip())
+    if raw_choice.isdigit() and 1 <= int(raw_choice) <= len(models):
+        model_name = models[int(raw_choice) - 1]
+    elif raw_choice:
+        model_name = raw_choice
+    else:
+        print("[INFO] 未入力のため中止します。メニューに戻ります。")
+        input("\nメニューに戻るには何かキーを押してください...")
+        return
+
+    raw_ctx = input("num_ctx（コンテキスト長。空Enterで既定8192）: ").strip()
+    num_ctx = int(raw_ctx) if raw_ctx.isdigit() else 8192
+
+    print(f"[TEST MODE] model={model_name} / num_ctx={num_ctx}")
+    start_interactive_chat(model_name, exec_mode, server_proc, num_ctx=num_ctx)
+    input("\nメニューに戻るには何かキーを押してください...")
+
+
 def main():
     """
     単体起動（例: python arc_agent.py）専用のメニュー駆動フロー。
@@ -860,6 +899,7 @@ def main():
         print(" [w] 作業ディレクトリの変更")
         print(" [l] ログモード (会話をファイル保存＋生ストリーム表示)")
         print(" [d] 生ダンプモード (フィールド切り替え式・都度出力)")
+        print(" [t] テストモード (インストール済みモデル+num_ctxを自由に指定)")
         print(" [0] 終了")
         print("===================================================")
         print(f" [Mode]      Current: {EXEC_MODES[CURRENT_MODE]}")
@@ -869,7 +909,7 @@ def main():
         print(f" [Prompt]    Loaded from '{PROMPT_FILE}'")
         print("===================================================")
 
-        raw_choice = input("メニュー番号を入力 (1-7 / m / w / l / d / 0=終了): ")
+        raw_choice = input("メニュー番号を入力 (1-7 / m / w / l / d / t / 0=終了): ")
         choice = unicodedata.normalize('NFKC', raw_choice).strip().lower()
 
         if choice in MODELS:
@@ -893,6 +933,9 @@ def main():
             _select_model_and_run(CURRENT_MODE, log_file,
                                   debug_mode=True, raw_dump=True,
                                   header="生ダンプモード用モデル選択")
+
+        elif choice == "t":
+            _test_mode_launch(CURRENT_MODE, log_file)
 
         elif choice == "0":
             # ★ 終了時: VRAM解放してから全プロセスを掃除
