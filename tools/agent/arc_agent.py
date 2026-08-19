@@ -482,6 +482,12 @@ def start_interactive_chat(model_name: str, exec_mode: str, server_proc,
 
     MAX_AUTO_STEPS = 12
     MAX_SAME_ACTION = 2
+    # [NOTE] 実機テストで、Plan/Writer役が「今すぐ書けるのに、rememberに
+    # 内容を少しずつ書き残すだけで本来の仕事(return_to_caller)をしない」
+    # という不具合を繰り返し起こした（毎回内容が違うため、下の「同一アクション
+    # 連続検知」には引っかからなかった）。プロンプト側で軽減したが、プロンプトの
+    # 指示追従は確率的で完全ではないため、コード側にも保険をかけておく。
+    MAX_REMEMBER_STREAK = 2
 
     # [IMPORTANT] 想定外の例外（バグ・EOFError等）でここから抜けた場合でも、
     # VRAM解放だけは必ず行う。既知の終了経路はそれぞれ自分でteardown()を
@@ -524,6 +530,7 @@ def start_interactive_chat(model_name: str, exec_mode: str, server_proc,
             auto_steps = 0
             last_action_signature = None
             same_action_count = 0
+            remember_streak = 0
 
             while True:
                 payload = json.dumps({
@@ -565,21 +572,28 @@ def start_interactive_chat(model_name: str, exec_mode: str, server_proc,
 
                 effective_tool_calls = tool_calls or tool_call_from_content(strip_think_blocks(ai_response_full))
 
-                return_info = return_to_caller_from_tool_calls(effective_tool_calls)
-                if return_info:
-                    cleaned_up = True
-                    if is_nested:
-                        print(f"\n[RETURN] 呼び出し元に会話を戻します。")
-                        append_session_log(log_path, "System", f"呼び出し元に戻る: {return_info['summary']}")
-                        return teardown(return_info["summary"])
-                    else:
-                        print(f"\n[完了] {return_info['summary']}")
-                        append_session_log(log_path, "System", f"完了: {return_info['summary']}")
-                        return teardown()
-
+                # [IMPORTANT] return_to_callerを他のtool呼び出しより先にチェックしていると、
+                # モデルが1回の返答で複数tool（例: remember + return_to_caller）をまとめて
+                # 出した時、return_to_callerの方だけが処理されて他のtool呼び出しが無言で
+                # 捨てられる不具合になる（実機で確認済み。「rememberを呼んだのに
+                # shared_memory.mdに書かれない」という形で顕在化した）。
+                # 「1回の返答で出すアクションは1個だけ」というプロンプト側の指示は
+                # 確率的にしか守られないため、コード側でも先に実行すべきactionが
+                # あればそちらを優先し、return_to_callerはactionsが無い時だけ見る。
                 actions = tool_calls_to_actions(effective_tool_calls)
 
                 if not actions:
+                    return_info = return_to_caller_from_tool_calls(effective_tool_calls)
+                    if return_info:
+                        cleaned_up = True
+                        if is_nested:
+                            print(f"\n[RETURN] 呼び出し元に会話を戻します。")
+                            append_session_log(log_path, "System", f"呼び出し元に戻る: {return_info['summary']}")
+                            return teardown(return_info["summary"])
+                        else:
+                            print(f"\n[完了] {return_info['summary']}")
+                            append_session_log(log_path, "System", f"完了: {return_info['summary']}")
+                            return teardown()
                     break
 
                 actions = actions[:1]
@@ -609,6 +623,30 @@ def start_interactive_chat(model_name: str, exec_mode: str, server_proc,
                         append_session_log(log_path, "System", f"暴走検知により呼び出し元に戻る: {report}")
                         cleaned_up = True
                         return teardown(report or "同じ操作が繰り返されたため、途中で強制停止しました。")
+                    break
+
+                # 物理防御1.5: remember連投検知（内容が毎回違っても、rememberばかりで
+                # 本来の仕事(実作業/return_to_caller)が進んでいなければ暴走とみなす）
+                if actions[0]["type"] == "remember":
+                    remember_streak += 1
+                else:
+                    remember_streak = 0
+
+                if remember_streak >= MAX_REMEMBER_STREAK:
+                    print(f"\n[SYSTEM] 物理防御作動: rememberが{MAX_REMEMBER_STREAK}回連続。強制停止します。")
+                    messages.append({
+                        "role": "user",
+                        "content": "[SYSTEM NOTICE] rememberの連続呼び出しが検出されました。"
+                                   "rememberはメモ帳ではありません。これ以上rememberを呼ばず、"
+                                   "今すぐ本来の作業（実際の作業か、それが既に十分なら"
+                                   "return_to_caller）を行ってください。"
+                    })
+                    report = _final_report(messages, model_name, debug_mode, chat_log_file)
+                    if is_nested:
+                        print("\n[RETURN] rememberの連投を検知したため、呼び出し元に会話を戻します。")
+                        append_session_log(log_path, "System", f"remember連投検知により呼び出し元に戻る: {report}")
+                        cleaned_up = True
+                        return teardown(report or "rememberが連続で呼ばれたため、途中で強制停止しました。")
                     break
 
                 feedback_parts = []

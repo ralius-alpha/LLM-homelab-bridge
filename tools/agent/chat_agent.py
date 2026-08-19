@@ -212,6 +212,19 @@ def run_chat_loop(model_name, server_proc, log_path):
 
             effective_tool_calls = tool_calls or tool_call_from_content(content)
 
+            # [IMPORTANT] handoff_to_roleをremember等より先にチェックしていると、
+            # 1回の返答でhandoff_to_role + rememberがまとめて出た時、handoffだけが
+            # 処理されてrememberが無言で捨てられる（arc_agent.py側で実機確認した
+            # のと同じ系統の不具合）。remember等の処理を先に行い、handoffは最後に
+            # チェックする。
+            remembered = False
+            for act in tool_calls_to_actions(effective_tool_calls):
+                if act["type"] == "remember":
+                    append_shared_memory(BASE_DIR, "chat", act["note"])
+                    print(f"\n[REMEMBER] 共有メモに書き残しました: {act['note']}")
+                    append_session_log(log_path, "System", f"共有メモに追記: {act['note']}")
+                    remembered = True
+
             handoff = handoff_from_tool_calls(effective_tool_calls)
             if handoff:
                 role_id = handoff["role_id"]
@@ -235,14 +248,6 @@ def run_chat_loop(model_name, server_proc, log_path):
                     messages.append({"role": "tool", "content": note})
                     print(f"\n{note}\n")
                 continue
-
-            remembered = False
-            for act in tool_calls_to_actions(effective_tool_calls):
-                if act["type"] == "remember":
-                    append_shared_memory(BASE_DIR, "chat", act["note"])
-                    print(f"\n[REMEMBER] 共有メモに書き残しました: {act['note']}")
-                    append_session_log(log_path, "System", f"共有メモに追記: {act['note']}")
-                    remembered = True
 
             # モデルがtoolだけ呼んで会話文を何も返さなかった場合、ユーザーには何も
             # 表示されず固まったように見える。必ず何かは表示する。
