@@ -21,6 +21,7 @@ from scripts.config import (
     THINKING_FIELDS,
     SPINNER_FRAMES,
 )
+from scripts.tools import TOOLS, tool_calls_to_actions, tool_call_from_content
 
 # ==========================================
 # 1. 動作・環境設定 (Intel Arc A770 最適化)
@@ -95,10 +96,10 @@ class Spinner:
 
 def get_default_agent_prompt():
     return r"""あなたはWindows PC上でコマンドとファイル編集を実行できる自律型CLIエージェントです。
-実行は [EXECUTE_COMMAND]...[/EXECUTE_COMMAND]、編集は [EDIT_FILE]...[/EDIT_FILE] を使う。
-ファイルを読むときは Get-Content ではなく [READ_FILE] / FILE: パス / [/READ_FILE] を使う（文字化けせず行番号付きで読める）。
-コード改造は全文書き換え禁止。必ず [EDIT_FILE] の SEARCH/REPLACE で一部だけ直すこと。
-1回の返答でアクションは1個だけ。[EDIT OK] が出たら成功なので同じ編集を繰り返さない。
+実行・編集・読み込みは、テキストのタグではなく、必ずtool呼び出し（execute_command / edit_file / read_file）で行う。
+ファイルを読むときは Get-Content ではなく read_file を使う（文字化けせず行番号付きで読める）。
+コード改造は全文書き換え禁止。必ず edit_file の search/replace で一部だけ直すこと。
+1回の返答でtool呼び出しは1個だけ。成功結果が返ってきたら同じ呼び出しを繰り返さない。
 回答は日本語で。
 """
 
@@ -258,58 +259,6 @@ def clean_clixml_noise(text: str) -> str:
     text = re.sub(r"#<\s*CLIXML.*", "", text, flags=re.DOTALL | re.IGNORECASE)
     text = re.sub(r"Preparing modules for first use\.?", "", text, flags=re.IGNORECASE)
     return text.strip()
-
-
-# ==========================================
-# 2. アクション抽出
-# ==========================================
-def extract_actions(response_text):
-    target_text = strip_think_blocks(response_text)
-    actions = []
-
-    combined = re.compile(
-        r"(\[EXECUTE_COMMAND\](?P<cmd>.*?)\[/EXECUTE_COMMAND\])"
-        r"|(\[EDIT_FILE\](?P<edit>.*?)\[/EDIT_FILE\])"
-        r"|(\[READ_FILE\](?P<read>.*?)\[/READ_FILE\])",
-        re.DOTALL
-    )
-
-    for m in combined.finditer(target_text):
-        if m.group("cmd") is not None:
-            raw_cmd = m.group("cmd")
-            clean_lines = [
-                line.strip() for line in raw_cmd.splitlines()
-                if line.strip() and not line.strip().startswith('#')
-            ]
-            if clean_lines:
-                sanitized = " ; ".join(clean_lines)
-                if "[EXECUTE_COMMAND]" not in sanitized:
-                    actions.append({"type": "command", "content": sanitized})
-
-        elif m.group("edit") is not None:
-            block = m.group("edit")
-            file_match = re.search(r"FILE:\s*(.+)", block)
-            sr_match = re.search(
-                r"<<<<<<<\s*SEARCH\s*\n(.*?)\n=======\s*\n(.*?)\n>>>>>>>\s*REPLACE",
-                block, re.DOTALL
-            )
-            if file_match and sr_match:
-                actions.append({
-                    "type": "edit",
-                    "file": file_match.group(1).strip().strip("'\""),
-                    "search": sr_match.group(1),
-                    "replace": sr_match.group(2)
-                })
-
-        elif m.group("read") is not None:
-            block = m.group("read")
-            file_match = re.search(r"FILE:\s*(.+)", block)
-            if file_match:
-                actions.append({
-                    "type": "read",
-                    "file": file_match.group(1).strip().strip("'\"")
-                })
-    return actions
 
 
 # ==========================================
@@ -557,6 +506,7 @@ def stream_chat_response(req, debug_mode: bool, raw_dump: bool = False):
                  思考中は『思考中』、本文中は『出力中』とラベルを切り替える。
        raw_dump=True: role等のノイズを無視し、フィールドが変わったらヘッダを出して都度出力。"""
     ai_response_full = ""
+    tool_calls_full = []
 
     # ---------- 生ダンプモード ----------
     if raw_dump:
@@ -571,6 +521,10 @@ def stream_chat_response(req, debug_mode: bool, raw_dump: bool = False):
                 chunk = json.loads(line.decode("utf-8"))
                 msg_obj = chunk.get("message", {})
                 chunk_index += 1
+
+                tc = msg_obj.get("tool_calls")
+                if tc:
+                    tool_calls_full.extend(tc)
 
                 for field_name, value in msg_obj.items():
                     if field_name in IGNORE_FIELDS:
@@ -599,7 +553,7 @@ def stream_chat_response(req, debug_mode: bool, raw_dump: bool = False):
         else:
             print("[SUMMARY] 中身のあるフィールドはありませんでした。")
         print("==================================")
-        return ai_response_full
+        return ai_response_full, tool_calls_full
 
     # ---------- 通常 / ログモード ----------
     spinner = Spinner()
@@ -614,6 +568,10 @@ def stream_chat_response(req, debug_mode: bool, raw_dump: bool = False):
                     continue
                 chunk = json.loads(line.decode("utf-8"))
                 msg_obj = chunk.get("message", {})
+
+                tc = msg_obj.get("tool_calls")
+                if tc:
+                    tool_calls_full.extend(tc)
 
                 content = msg_obj.get("content", "")
                 thinking = ""
@@ -647,7 +605,7 @@ def stream_chat_response(req, debug_mode: bool, raw_dump: bool = False):
         if visible:
             print(visible)
 
-    return ai_response_full
+    return ai_response_full, tool_calls_full
 
 
 # ==========================================
@@ -713,6 +671,7 @@ def start_interactive_chat(model_name: str, exec_mode: str,
             payload = json.dumps({
                 "model": model_name,
                 "messages": messages,
+                "tools": TOOLS,
                 "stream": True,
                 "keep_alive": KEEP_ALIVE,
                 "options": {
@@ -730,18 +689,22 @@ def start_interactive_chat(model_name: str, exec_mode: str,
             print("\n--- Response ---")
 
             try:
-                ai_response_full = stream_chat_response(req, debug_mode, raw_dump)
+                ai_response_full, tool_calls = stream_chat_response(req, debug_mode, raw_dump)
             except urllib.error.URLError as e:
                 print(f"\n[ERROR] 通信エラー: {e}")
                 return
 
             print()
-            messages.append({"role": "assistant", "content": ai_response_full})
+            assistant_msg = {"role": "assistant", "content": ai_response_full}
+            if tool_calls:
+                assistant_msg["tool_calls"] = tool_calls
+            messages.append(assistant_msg)
             if chat_log_file:
                 with open(chat_log_file, "a", encoding="utf-8") as f:
                     f.write(f"\n[AI Response]\n{ai_response_full}\n")
 
-            actions = extract_actions(ai_response_full)
+            effective_tool_calls = tool_calls or tool_call_from_content(strip_think_blocks(ai_response_full))
+            actions = tool_calls_to_actions(effective_tool_calls)
 
             if not actions:
                 break
@@ -786,7 +749,7 @@ def start_interactive_chat(model_name: str, exec_mode: str,
                     feedback_parts.append(res)
 
             feedback = "\n\n".join(feedback_parts)
-            messages.append({"role": "user", "content": feedback})
+            messages.append({"role": "tool", "content": feedback})
             if chat_log_file:
                 with open(chat_log_file, "a", encoding="utf-8") as f:
                     f.write(f"\n[Action Results]\n{feedback}\n")
@@ -815,7 +778,7 @@ def _final_report(messages, model_name, debug_mode, chat_log_file):
         headers={"Content-Type": "application/json"})
     print("\n--- 最終報告 ---")
     try:
-        report = stream_chat_response(req, debug_mode, raw_dump=False)
+        report, _ = stream_chat_response(req, debug_mode, raw_dump=False)
         print()
         if chat_log_file:
             with open(chat_log_file, "a", encoding="utf-8") as f:
