@@ -25,7 +25,7 @@ GPU(VRAM)が1本しかないため、複数の役を同時には動かせない�
 | 役 | 定義 | 実行する側のモジュール | できること |
 |----|------|----------------------|-----------|
 | 雑談役 (chat) | `roles/chat/` | `chat_agent.py` | 会話のみ。ファイル操作・コマンド実行は不可 |
-| Execute役 (execute) | `roles/execute/` | `arc_agent.py` | コマンド実行・ファイル編集・調査系スキル・共有メモ書き込み |
+| Execute役 (execute) | `roles/execute/` | `arc_agent.py` | コマンド実行・ファイル編集/新規作成・調査系スキル・共有メモ書き込み |
 | Review役 (review) | `roles/review/` | `arc_agent.py`（共用） | ファイルを読んで指摘するだけ。編集不可 |
 | Plan役 (plan) | `roles/plan/` | `arc_agent.py`（共用） | 依頼を実行前に順序立てた計画に分解する。実行はしない |
 | Writer役 (writer) | `roles/writer/` | `arc_agent.py`（共用） | コード・ログを説明文/記事に書き起こす。ファイル編集は不可 |
@@ -651,7 +651,7 @@ tools/agent/
     ├── config.py               定数（ファイル名等）
     ├── ollama.py               Ollamaサーバーのライフサイクル管理（起動・停止・VRAM解放）
     ├── tools.py                  tool定義・TOOL_REGISTRY・tool_calls⇔内部アクション形式の変換
-    ├── skills.py                   役をまたいで再利用できる能力の実装（現状はweb_search）
+    ├── skills.py                   役をまたいで再利用できる能力の実装（web_search/fetch_url/summarize_text/calculate/git_diff_summary）
     ├── display.py                 ストリーム応答の表示（Spinner・思考中/出力中表示）。役をまたいで共通
     ├── role_loader.py            roles/ からの役の読み込み。専門性・引き継ぎ先の解決も担う
     ├── dispatch.py                役の入れ子呼び出しの共通化（role.jsonの"module"を動的import）
