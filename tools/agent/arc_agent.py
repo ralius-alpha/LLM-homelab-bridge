@@ -743,9 +743,24 @@ def _final_report(messages, model_name, debug_mode, chat_log_file):
     報告文字列を返す（失敗時はNone）。呼び出し元は、nested実行中ならこれを
     そのままreturn_to_callerの要約として使い、呼び出し元に自動的に会話を戻す。
     """
+    # [NOTE] 暴走停止までに調査対象を無限に広げてしまった等で会話が非常に
+    # 長くなっているケースでは、そのまま全履歴を送るとnum_ctx=16384でも
+    # サーバー側の処理が重すぎて失敗する（HTTP 500）ことを実機で確認した
+    # （Arc A770でのVRAM不足が有力な原因）。暴走を検知した直後の呼び出しで
+    # あることが確定しているここでは、system prompt + 直近のやり取りだけに
+    # 絞ることで、最終報告のリクエスト自体は会話がどれだけ長くなっていても
+    # 常に軽量であることを保証する（プロンプト側の「調査範囲を広げすぎない」
+    # 指示に頼らない、コード側の保険）。
+    MAX_REPORT_MESSAGES = 10
+    report_messages = messages
+    if len(messages) > MAX_REPORT_MESSAGES + 1:
+        system_msgs = [m for m in messages if m.get("role") == "system"]
+        recent = messages[-MAX_REPORT_MESSAGES:]
+        report_messages = system_msgs + recent
+
     payload = json.dumps({
         "model": model_name,
-        "messages": messages,
+        "messages": report_messages,
         "stream": True,
         "keep_alive": KEEP_ALIVE,
         "options": {"num_ctx": 16384, "temperature": 0.3}
