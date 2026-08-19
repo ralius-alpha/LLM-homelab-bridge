@@ -41,6 +41,7 @@ from scripts.tools import (
     tool_calls_to_actions,
     handoff_from_tool_calls,
 )
+from scripts.display import stream_chat_response
 from scripts.role_loader import load_role
 from scripts.memory import (
     start_session_log,
@@ -61,44 +62,6 @@ CHAT_MODEL = ROLE["model"]
 
 # Execute役に引き継ぐ時の既定モデル（Qwen2.5-Coder 14B・推奨）
 EXECUTE_DEFAULT_MODEL_KEY = "6"
-
-
-def stream_chat(req):
-    """ストリーム応答を表示しつつ、content全文とtool_callsを返す。"""
-    content_full = ""
-    tool_calls_full = []
-    thinking_started = False
-    content_started = False
-
-    with urllib.request.urlopen(req, timeout=300) as res:
-        for line in res:
-            if not line:
-                continue
-            chunk = json.loads(line.decode("utf-8"))
-            msg = chunk.get("message", {})
-
-            tc = msg.get("tool_calls")
-            if tc:
-                tool_calls_full.extend(tc)
-
-            thinking = ""
-            for k, v in msg.items():
-                if k in ("thinking", "reasoning", "reasoning_content") and isinstance(v, str):
-                    thinking += v
-            if thinking and not thinking_started:
-                thinking_started = True
-                print("[思考中...]", end="", flush=True)
-
-            piece = msg.get("content", "")
-            if piece:
-                if not content_started:
-                    content_started = True
-                    print("\n" if thinking_started else "", end="")
-                print(piece, end="", flush=True)
-                content_full += piece
-
-    print()
-    return content_full, tool_calls_full
 
 
 def run_execute_and_wait(server_proc, instructions):
@@ -184,7 +147,7 @@ def run_chat_loop(model_name, server_proc, log_path):
 
             print("\n--- Response ---")
             try:
-                content, tool_calls = stream_chat(req)
+                content, tool_calls = stream_chat_response(req)
             except urllib.error.URLError as e:
                 print(f"\n[ERROR] 通信エラー: {e}")
                 cleaned_up = True

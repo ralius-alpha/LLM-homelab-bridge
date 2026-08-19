@@ -41,6 +41,12 @@ tool呼び出しの実処理（`run_command`等）も`arc_agent.py`側の実装�
 `role.json`の`tools`を絞るだけで対応できるが、Execute系の実処理を使わない
 役を作る場合はコード側の対応が別途必要になる。
 
+[NOTE] ストリーム応答の表示（点字スピナー・「思考中」→「出力中」のラベル切り替え・
+トークン数表示）は`scripts/display.py`の`stream_chat_response()`に共通化してあり、
+`chat_agent.py`/`arc_agent.py`どちらも同じものを使う。以前は`chat_agent.py`だけ
+別の簡易実装（スピナー無し）を個別に持っていて表示が役ごとに揃っていなかったが、
+これは役の「定義」の話ではなく実装の重複だったため、ここに一本化した。
+
 起動はユーザーが `chat_agent.py` を実行するところから始まる:
 
 ```powershell
@@ -215,6 +221,7 @@ tools/agent/
     ├── config.py               定数（ファイル名等）
     ├── ollama.py               Ollamaサーバーのライフサイクル管理（起動・停止・VRAM解放）
     ├── tools.py                  tool定義・TOOL_REGISTRY・tool_calls⇔内部アクション形式の変換
+    ├── display.py                 ストリーム応答の表示（Spinner・思考中/出力中表示）。役をまたいで共通
     ├── role_loader.py            roles/ からの役の読み込み
     └── memory.py                 セッションログ・共有メモ(shared_memory.md)の読み書き
 ```
