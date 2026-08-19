@@ -12,6 +12,11 @@ import urllib.request
 import urllib.error
 from datetime import datetime
 
+# 点字スピナー等、日本語Windowsのコンソール既定(cp932)では表示できない文字を
+# 出すことがある。素のprintだと即クラッシュするため、置換表示に倒す。
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
 from scripts.config import (
     OLLAMA_HOST,
     KEEP_ALIVE,
@@ -21,7 +26,22 @@ from scripts.config import (
     THINKING_FIELDS,
     SPINNER_FRAMES,
 )
-from scripts.tools import TOOLS, tool_calls_to_actions, tool_call_from_content
+from scripts.ollama import (
+    setup_environment,
+    cleanup_processes,
+    unload_all_models,
+    startup_cleanup,
+    wait_for_server,
+    run_server,
+    warmup_model,
+)
+from scripts.tools import TOOLS, tool_calls_to_actions, tool_call_from_content, return_to_chat_from_tool_calls
+from scripts.memory import (
+    start_session_log,
+    append_session_log,
+    append_shared_memory,
+    build_system_prompt_with_memory,
+)
 
 # ==========================================
 # 1. 動作・環境設定 (Intel Arc A770 最適化)
@@ -96,10 +116,11 @@ class Spinner:
 
 def get_default_agent_prompt():
     return r"""あなたはWindows PC上でコマンドとファイル編集を実行できる自律型CLIエージェントです。
-実行・編集・読み込みは、テキストのタグではなく、必ずtool呼び出し（execute_command / edit_file / read_file）で行う。
+実行・編集・読み込みは、テキストのタグではなく、必ずtool呼び出し（execute_command / edit_file / read_file / remember / return_to_chat）で行う。
 ファイルを読むときは Get-Content ではなく read_file を使う（文字化けせず行番号付きで読める）。
 コード改造は全文書き換え禁止。必ず edit_file の search/replace で一部だけ直すこと。
 1回の返答でtool呼び出しは1個だけ。成功結果が返ってきたら同じ呼び出しを繰り返さない。
+作業がすべて完了したら return_to_chat を呼んで雑談役に会話を戻す。
 回答は日本語で。
 """
 
@@ -109,140 +130,6 @@ def load_system_prompt():
         with open(PROMPT_FILE, "r", encoding="utf-8") as f:
             return f.read().strip()
     return get_default_agent_prompt()
-
-
-def setup_environment():
-    os.environ["OLLAMA_DEBUG"] = "1"
-    os.environ["OLLAMA_NUM_PARALLEL"] = "1"
-    os.environ["SYCL_PI_LEVEL_ZERO_USE_IMMEDIATE_COMMANDLISTS"] = "1"
-    os.environ["SYCL_CACHE_PERSISTENT"] = "1"
-    os.environ["SYCL_ENABLE_DEFAULT_CONTEXTS"] = "1"
-    os.environ["ONEAPI_DEVICE_SELECTOR"] = "level_zero:0"
-    os.environ["OLLAMA_GPU_OVERHEAD"] = "1024"
-
-    local_app_data = os.environ.get("LOCALAPPDATA", "")
-    ollama_path = os.path.join(local_app_data, "Programs", "Ollama")
-    if os.path.exists(ollama_path):
-        os.environ["PATH"] = f"{ollama_path};{os.environ['PATH']}"
-
-
-def cleanup_processes():
-    """Ollamaプロセスを完全に掃除する。"""
-    if shutil.which("taskkill"):
-        subprocess.run("taskkill /f /im ollama.exe", shell=True,
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        subprocess.run("taskkill /f /im ollama_llama_server.exe", shell=True,
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        subprocess.run("taskkill /f /im \"ollama app.exe\"", shell=True,
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    time.sleep(1)
-
-
-def unload_all_models():
-    """ロード中のモデルを keep_alive:0 でVRAMから即座に降ろす。"""
-    try:
-        req = urllib.request.Request(f"{OLLAMA_HOST}/api/ps")
-        with urllib.request.urlopen(req, timeout=3) as res:
-            data = json.loads(res.read().decode("utf-8"))
-        loaded = data.get("models", [])
-        if not loaded:
-            return
-        for m in loaded:
-            name = m.get("name") or m.get("model")
-            if not name:
-                continue
-            print(f"[UNLOAD] モデルをVRAMから解放中: {name}")
-            payload = json.dumps({"model": name, "keep_alive": 0}).encode("utf-8")
-            r = urllib.request.Request(
-                f"{OLLAMA_HOST}/api/generate", data=payload,
-                headers={"Content-Type": "application/json"})
-            try:
-                with urllib.request.urlopen(r, timeout=10) as _:
-                    pass
-            except Exception:
-                pass
-        time.sleep(1)
-    except Exception:
-        # サーバーが既に落ちている等は無視
-        pass
-
-
-def startup_cleanup():
-    """起動時に、既に動いているOllamaサーバー/プロセスがあれば全部掃除する。"""
-    print("[STARTUP] 既存のOllamaプロセスを確認中...")
-    found = False
-
-    try:
-        with urllib.request.urlopen(OLLAMA_HOST, timeout=1) as res:
-            if res.status == 200:
-                found = True
-                print("[STARTUP] 既に起動中のOllamaサーバーを検出しました。")
-    except Exception:
-        pass
-
-    if shutil.which("tasklist"):
-        try:
-            result = subprocess.run("tasklist", shell=True,
-                                    capture_output=True, text=True)
-            if "ollama" in (result.stdout or "").lower():
-                found = True
-        except Exception:
-            pass
-
-    if found:
-        print("[STARTUP] 既存のOllamaプロセスを全て終了します...")
-        cleanup_processes()
-        time.sleep(1)
-        print("[STARTUP] クリーンアップ完了。")
-    else:
-        print("[STARTUP] 起動中のOllamaはありません。そのまま続行します。")
-
-
-def wait_for_server(timeout=20):
-    start_time = time.time()
-    while time.time() - start_time < timeout:
-        try:
-            with urllib.request.urlopen(OLLAMA_HOST, timeout=1) as response:
-                if response.status == 200:
-                    return True
-        except Exception:
-            pass
-        time.sleep(0.5)
-    return False
-
-
-def run_server(log_file):
-    print("[SERVER] サーバー起動中...")
-    if os.path.exists(log_file):
-        try:
-            os.remove(log_file)
-        except OSError:
-            pass
-    f_log = open(log_file, "w", encoding="utf-8")
-    server_proc = subprocess.Popen(["ollama", "serve"], stdout=f_log,
-                                   stderr=subprocess.STDOUT, text=True)
-    if not wait_for_server():
-        print("[ERROR] サーバーの起動確認にタイムアウトしました。")
-    else:
-        print("[SERVER] サーバー起動完了。")
-    return server_proc
-
-
-def warmup_model(model_name):
-    print("[INFO] 初期プロンプト注入中...")
-    _ = load_system_prompt()
-    time.sleep(0.5)
-    print("[INFO] 初期プロンプト解読中（AI）...")
-    try:
-        payload = json.dumps({"model": model_name, "keep_alive": KEEP_ALIVE}).encode("utf-8")
-        req = urllib.request.Request(
-            f"{OLLAMA_HOST}/api/generate", data=payload,
-            headers={"Content-Type": "application/json"})
-        with urllib.request.urlopen(req, timeout=180) as res:
-            pass
-        print("[INFO] 解読完了。準備が整いました。")
-    except Exception as e:
-        print(f"[WARN] モデルロード中にエラーが発生しましたが続行します: {e}")
 
 
 def strip_think_blocks(text: str) -> str:
@@ -412,6 +299,14 @@ def run_read(read):
     numbered = "\n".join(f"{i + 1}: {line}" for i, line in enumerate(lines))
     print(f"[READ OK] {len(lines)}行を読み込みました。")
     return f"[FILE CONTENT of {file_path} ({len(lines)}行)]\n{numbered}"
+
+
+def run_remember(act):
+    """全役共通の共有メモ(shared_memory.md)に1件書き残す。"""
+    note = act["note"]
+    append_shared_memory(BASE_DIR, "execute", note)
+    print(f"\n[REMEMBER] 共有メモに書き残しました: {note}")
+    return f"[REMEMBER OK] 共有メモに書き残しました: {note}"
 
 
 # ==========================================
@@ -611,9 +506,33 @@ def stream_chat_response(req, debug_mode: bool, raw_dump: bool = False):
 # ==========================================
 # 6. 対話セッション（物理防御入り）
 # ==========================================
-def start_interactive_chat(model_name: str, exec_mode: str,
-                           debug_mode: bool = False, raw_dump: bool = False):
+def start_interactive_chat(model_name: str, exec_mode: str, server_proc,
+                           debug_mode: bool = False, raw_dump: bool = False,
+                           initial_message: str = None, is_nested: bool = False):
+    """
+    Execute役のセッション本体。
+
+    is_nested=True の場合、雑談役から直接呼び出されている（入れ子呼び出し）。
+    この場合は自分でOllamaサーバーを止めたりしない（呼び出し元と共有しているため）。
+    代わりに、自分のモデルだけVRAMから解放してから、呼び出し元に制御を返す
+    （return_to_chatが呼ばれれば要約文字列を、それ以外の終了ならNoneを返す）。
+
+    is_nested=False（単体起動時）は今まで通り、終了時にサーバーも止めて完全に片付ける。
+    """
     warmup_model(model_name)
+    log_path = start_session_log(BASE_DIR, "execute")
+
+    def teardown(summary=None):
+        """呼び出し元に返す前の後片付け。nestedならモデル解放だけ、単体ならサーバーも止める。"""
+        unload_all_models()
+        if not is_nested:
+            try:
+                server_proc.terminate()
+                server_proc.wait(timeout=5)
+            except Exception:
+                pass
+            cleanup_processes()
+        return summary
 
     chat_log_file = None
     if debug_mode:
@@ -633,139 +552,202 @@ def start_interactive_chat(model_name: str, exec_mode: str,
         print("[MODE] ログモード有効（生ストリーム＋会話ファイル保存）")
     print("※ 終了: 'exit'/'quit' / 送信: 新しい行で 'EOF' か Ctrl+Z/Ctrl+D\n")
 
-    messages = [{"role": "system", "content": load_system_prompt()}]
+    messages = [{"role": "system", "content": build_system_prompt_with_memory(load_system_prompt(), BASE_DIR)}]
     print("[AI] 初期化が完了しました。質問をどうぞ。")
 
     MAX_AUTO_STEPS = 12
     MAX_SAME_ACTION = 2
 
-    while True:
-        try:
-            print("\n[Input] ---------------------------------")
-            lines = []
-            while True:
-                line = input(">>> " if not lines else "... ")
-                if not lines and line.strip().lower() in ["exit", "quit"]:
-                    return
-                if line.strip().upper() == "EOF":
-                    break
-                lines.append(line)
-        except (EOFError, KeyboardInterrupt):
-            print("\n[INFO] 対話を終了します。")
-            return
-
-        user_input = "\n".join(lines).strip()
-        if not user_input:
-            continue
-
-        messages.append({"role": "user", "content": user_input})
-        if chat_log_file:
-            with open(chat_log_file, "a", encoding="utf-8") as f:
-                f.write(f"\n[User Input]\n{user_input}\n")
-
-        auto_steps = 0
-        last_action_signature = None
-        same_action_count = 0
-
+    # [IMPORTANT] 想定外の例外（バグ・EOFError等）でここから抜けた場合でも、
+    # VRAM解放だけは必ず行う。既知の終了経路はそれぞれ自分でteardown()を
+    # 呼んでから return するので、cleaned_up フラグで二重に走らないようにする。
+    cleaned_up = False
+    try:
         while True:
-            payload = json.dumps({
-                "model": model_name,
-                "messages": messages,
-                "tools": TOOLS,
-                "stream": True,
-                "keep_alive": KEEP_ALIVE,
-                "options": {
-                    "num_ctx": 8192,
-                    "temperature": 0.2,
-                    "top_p": 0.9,
-                    "repeat_penalty": 1.15
-                }
-            }).encode("utf-8")
-
-            req = urllib.request.Request(
-                f"{OLLAMA_HOST}/api/chat", data=payload,
-                headers={"Content-Type": "application/json"})
-
-            print("\n--- Response ---")
-
-            try:
-                ai_response_full, tool_calls = stream_chat_response(req, debug_mode, raw_dump)
-            except urllib.error.URLError as e:
-                print(f"\n[ERROR] 通信エラー: {e}")
-                return
-
-            print()
-            assistant_msg = {"role": "assistant", "content": ai_response_full}
-            if tool_calls:
-                assistant_msg["tool_calls"] = tool_calls
-            messages.append(assistant_msg)
-            if chat_log_file:
-                with open(chat_log_file, "a", encoding="utf-8") as f:
-                    f.write(f"\n[AI Response]\n{ai_response_full}\n")
-
-            effective_tool_calls = tool_calls or tool_call_from_content(strip_think_blocks(ai_response_full))
-            actions = tool_calls_to_actions(effective_tool_calls)
-
-            if not actions:
-                break
-
-            actions = actions[:1]
-
-            # 物理防御1: 同一アクション連続検知
-            current_signature = json.dumps(actions[0], sort_keys=True, ensure_ascii=False)
-            if current_signature == last_action_signature:
-                same_action_count += 1
+            if initial_message is not None:
+                user_input = initial_message.strip()
+                initial_message = None
+                print("\n[Input] ---------------------------------")
+                print(f">>> {user_input}")
             else:
-                same_action_count = 0
-            last_action_signature = current_signature
+                try:
+                    print("\n[Input] ---------------------------------")
+                    lines = []
+                    while True:
+                        line = input(">>> " if not lines else "... ")
+                        if not lines and line.strip().lower() in ["exit", "quit"]:
+                            cleaned_up = True
+                            return teardown()
+                        if line.strip().upper() == "EOF":
+                            break
+                        lines.append(line)
+                except (EOFError, KeyboardInterrupt):
+                    print("\n[INFO] 対話を終了します。")
+                    cleaned_up = True
+                    return teardown()
+                user_input = "\n".join(lines).strip()
 
-            if same_action_count >= MAX_SAME_ACTION:
-                print(f"\n[SYSTEM] 物理防御作動: 同一アクションが{MAX_SAME_ACTION + 1}回連続。強制停止します。")
-                messages.append({
-                    "role": "user",
-                    "content": "[SYSTEM NOTICE] 同じアクションが繰り返し検出されました。"
-                               "その操作は既に成功済みです。これ以上アクションを出さず、"
-                               "行った変更内容を日本語で簡潔に報告して終了してください。"
-                })
-                _final_report(messages, model_name, debug_mode, chat_log_file)
-                break
+            if not user_input:
+                continue
 
-            feedback_parts = []
-            for act in actions:
-                if act["type"] == "command":
-                    res = run_command(act["content"], exec_mode)
-                    MAX_FEEDBACK = 14000
-                    if len(res) > MAX_FEEDBACK:
-                        res = res[:MAX_FEEDBACK] + "\n...(長いため省略)"
-                    feedback_parts.append(f"[SYSTEM COMMAND OUTPUT for '{act['content']}']\n{res}")
-                elif act["type"] == "edit":
-                    res = run_edit(act, exec_mode)
-                    feedback_parts.append(res)
-                elif act["type"] == "read":
-                    res = run_read(act)
-                    MAX_FEEDBACK = 14000
-                    if len(res) > MAX_FEEDBACK:
-                        res = res[:MAX_FEEDBACK] + "\n...(長いため省略)"
-                    feedback_parts.append(res)
-
-            feedback = "\n\n".join(feedback_parts)
-            messages.append({"role": "tool", "content": feedback})
+            messages.append({"role": "user", "content": user_input})
+            append_session_log(log_path, "User", user_input)
             if chat_log_file:
                 with open(chat_log_file, "a", encoding="utf-8") as f:
-                    f.write(f"\n[Action Results]\n{feedback}\n")
+                    f.write(f"\n[User Input]\n{user_input}\n")
 
-            # 物理防御2: 自動継続の絶対上限
-            auto_steps += 1
-            if auto_steps >= MAX_AUTO_STEPS:
-                print(f"\n[SYSTEM] 物理防御作動: 自動実行が上限({MAX_AUTO_STEPS}回)到達。強制停止します。")
-                break
+            auto_steps = 0
+            last_action_signature = None
+            same_action_count = 0
 
-            print("\n[SYSTEM] 実行結果をAIにフィードバックして解析中...")
-            continue
+            while True:
+                payload = json.dumps({
+                    "model": model_name,
+                    "messages": messages,
+                    "tools": TOOLS,
+                    "stream": True,
+                    "keep_alive": KEEP_ALIVE,
+                    "options": {
+                        "num_ctx": 8192,
+                        "temperature": 0.2,
+                        "top_p": 0.9,
+                        "repeat_penalty": 1.15
+                    }
+                }).encode("utf-8")
+
+                req = urllib.request.Request(
+                    f"{OLLAMA_HOST}/api/chat", data=payload,
+                    headers={"Content-Type": "application/json"})
+
+                print("\n--- Response ---")
+
+                try:
+                    ai_response_full, tool_calls = stream_chat_response(req, debug_mode, raw_dump)
+                except urllib.error.URLError as e:
+                    print(f"\n[ERROR] 通信エラー: {e}")
+                    cleaned_up = True
+                    return teardown()
+
+                print()
+                assistant_msg = {"role": "assistant", "content": ai_response_full}
+                if tool_calls:
+                    assistant_msg["tool_calls"] = tool_calls
+                messages.append(assistant_msg)
+                append_session_log(log_path, "Assistant", strip_think_blocks(ai_response_full) or "(tool呼び出しのみ)")
+                if chat_log_file:
+                    with open(chat_log_file, "a", encoding="utf-8") as f:
+                        f.write(f"\n[AI Response]\n{ai_response_full}\n")
+
+                effective_tool_calls = tool_calls or tool_call_from_content(strip_think_blocks(ai_response_full))
+
+                return_info = return_to_chat_from_tool_calls(effective_tool_calls)
+                if return_info:
+                    cleaned_up = True
+                    if is_nested:
+                        print(f"\n[RETURN] 雑談役に会話を戻します。")
+                        append_session_log(log_path, "System", f"雑談役に戻る: {return_info['summary']}")
+                        return teardown(return_info["summary"])
+                    else:
+                        print(f"\n[完了] {return_info['summary']}")
+                        append_session_log(log_path, "System", f"完了: {return_info['summary']}")
+                        return teardown()
+
+                actions = tool_calls_to_actions(effective_tool_calls)
+
+                if not actions:
+                    break
+
+                actions = actions[:1]
+
+                # 物理防御1: 同一アクション連続検知
+                current_signature = json.dumps(actions[0], sort_keys=True, ensure_ascii=False)
+                if current_signature == last_action_signature:
+                    same_action_count += 1
+                else:
+                    same_action_count = 0
+                last_action_signature = current_signature
+
+                if same_action_count >= MAX_SAME_ACTION:
+                    print(f"\n[SYSTEM] 物理防御作動: 同一アクションが{MAX_SAME_ACTION + 1}回連続。強制停止します。")
+                    messages.append({
+                        "role": "user",
+                        "content": "[SYSTEM NOTICE] 同じアクションが繰り返し検出されました。"
+                                   "その操作は既に成功済みです。これ以上アクションを出さず、"
+                                   "行った変更内容を日本語で簡潔に報告して終了してください。"
+                    })
+                    report = _final_report(messages, model_name, debug_mode, chat_log_file)
+                    if is_nested:
+                        # [IMPORTANT] ここでbreakして自分の入力待ちに戻ると、壊れた文脈のまま
+                        # ユーザーの次の発言を処理してしまい、同じ暴走を繰り返す。
+                        # nested実行中なら、暴走を検知した時点で強制的に雑談役へ戻す。
+                        print("\n[RETURN] 暴走を検知したため、雑談役に会話を戻します。")
+                        append_session_log(log_path, "System", f"暴走検知により雑談役に戻る: {report}")
+                        cleaned_up = True
+                        return teardown(report or "同じ操作が繰り返されたため、途中で強制停止しました。")
+                    break
+
+                feedback_parts = []
+                for act in actions:
+                    if act["type"] == "command":
+                        res = run_command(act["content"], exec_mode)
+                        MAX_FEEDBACK = 14000
+                        if len(res) > MAX_FEEDBACK:
+                            res = res[:MAX_FEEDBACK] + "\n...(長いため省略)"
+                        feedback_parts.append(f"[SYSTEM COMMAND OUTPUT for '{act['content']}']\n{res}")
+                    elif act["type"] == "edit":
+                        res = run_edit(act, exec_mode)
+                        feedback_parts.append(res)
+                    elif act["type"] == "read":
+                        res = run_read(act)
+                        MAX_FEEDBACK = 14000
+                        if len(res) > MAX_FEEDBACK:
+                            res = res[:MAX_FEEDBACK] + "\n...(長いため省略)"
+                        feedback_parts.append(res)
+                    elif act["type"] == "remember":
+                        res = run_remember(act)
+                        feedback_parts.append(res)
+
+                feedback = "\n\n".join(feedback_parts)
+                messages.append({"role": "tool", "content": feedback})
+                append_session_log(log_path, "Tool", feedback)
+                if chat_log_file:
+                    with open(chat_log_file, "a", encoding="utf-8") as f:
+                        f.write(f"\n[Action Results]\n{feedback}\n")
+
+                # 物理防御2: 自動継続の絶対上限
+                auto_steps += 1
+                if auto_steps >= MAX_AUTO_STEPS:
+                    print(f"\n[SYSTEM] 物理防御作動: 自動実行が上限({MAX_AUTO_STEPS}回)到達。強制停止します。")
+                    if is_nested:
+                        messages.append({
+                            "role": "user",
+                            "content": "[SYSTEM NOTICE] 自動実行の上限に達しました。これ以上アクションを"
+                                       "出さず、ここまでに行った内容を日本語で簡潔に報告して終了してください。"
+                        })
+                        report = _final_report(messages, model_name, debug_mode, chat_log_file)
+                        print("\n[RETURN] 自動実行の上限に達したため、雑談役に会話を戻します。")
+                        append_session_log(log_path, "System", f"上限到達により雑談役に戻る: {report}")
+                        cleaned_up = True
+                        return teardown(report or f"自動実行が上限({MAX_AUTO_STEPS}回)に達したため、途中で強制停止しました。")
+                    break
+
+                print("\n[SYSTEM] 実行結果をAIにフィードバックして解析中...")
+                continue
+    finally:
+        if not cleaned_up:
+            print("\n[WARN] 想定外の形でセッションが終了しました。後片付け（VRAM解放）だけは行います。")
+            try:
+                teardown()
+            except Exception as cleanup_err:
+                print(f"[ERROR] 後片付けにも失敗しました: {cleanup_err}")
 
 
 def _final_report(messages, model_name, debug_mode, chat_log_file):
-    """暴走停止後、最終報告を1回だけ生成させる（アクションは実行しない）"""
+    """
+    暴走停止後、最終報告を1回だけ生成させる（アクションは実行しない）。
+    報告文字列を返す（失敗時はNone）。呼び出し元は、nested実行中ならこれを
+    そのままreturn_to_chatの要約として使い、雑談役に自動的に会話を戻す。
+    """
     payload = json.dumps({
         "model": model_name,
         "messages": messages,
@@ -783,8 +765,15 @@ def _final_report(messages, model_name, debug_mode, chat_log_file):
         if chat_log_file:
             with open(chat_log_file, "a", encoding="utf-8") as f:
                 f.write(f"\n[Final Report]\n{report}\n")
+        # toolsを渡していない呼び出しだが、モデルがtool呼び出し風のJSONを
+        # そのまま書いてしまうことがある。summaryが拾えればそちらを使う。
+        forced_return = return_to_chat_from_tool_calls(tool_call_from_content(report))
+        if forced_return:
+            return forced_return["summary"]
+        return strip_think_blocks(report) or None
     except urllib.error.URLError as e:
         print(f"\n[ERROR] 最終報告の生成に失敗: {e}")
+        return None
 
 
 def select_exec_mode() -> str:
@@ -826,18 +815,6 @@ def select_work_dir():
     return WORK_DIR
 
 
-def _shutdown_session(server_proc):
-    """セッション終了時: VRAM解放 → サーバー停止 → プロセス掃除"""
-    print("\n[INFO] セッション終了。VRAM解放中...")
-    unload_all_models()
-    try:
-        server_proc.terminate()
-        server_proc.wait(timeout=5)
-    except Exception:
-        pass
-    cleanup_processes()
-
-
 def _select_model_and_run(exec_mode, log_file, debug_mode, raw_dump, header):
     """モデル選択→セッション起動の共通処理"""
     print(f"\n--- {header} ---")
@@ -850,12 +827,16 @@ def _select_model_and_run(exec_mode, log_file, debug_mode, raw_dump, header):
         return
     server_proc = run_server(log_file)
     _, model_name = MODELS[sub_choice]
-    start_interactive_chat(model_name, exec_mode, debug_mode=debug_mode, raw_dump=raw_dump)
-    _shutdown_session(server_proc)
+    start_interactive_chat(model_name, exec_mode, server_proc, debug_mode=debug_mode, raw_dump=raw_dump)
     input("\nメニューに戻るには何かキーを押してください...")
 
 
 def main():
+    """
+    単体起動（例: python arc_agent.py）専用のメニュー駆動フロー。
+    雑談役から入れ子で呼ばれる時はこのmain()は通らず、
+    chat_agent.pyがstart_interactive_chat()を直接呼ぶ。
+    """
     global CURRENT_MODE, WORK_DIR
     log_file = os.path.join(BASE_DIR, "ollama_server.log")
     setup_environment()
@@ -907,8 +888,7 @@ def main():
         if choice in MODELS:
             server_proc = run_server(log_file)
             _, model_name = MODELS[choice]
-            start_interactive_chat(model_name, CURRENT_MODE, debug_mode=False, raw_dump=False)
-            _shutdown_session(server_proc)
+            start_interactive_chat(model_name, CURRENT_MODE, server_proc, debug_mode=False, raw_dump=False)
             input("\nメニューに戻るには何かキーを押してください...")
 
         elif choice == "m":

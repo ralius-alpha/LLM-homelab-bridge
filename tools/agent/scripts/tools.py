@@ -18,7 +18,55 @@ Ollama の tool calling (function calling) 用のツール定義と、
 import json
 import re
 
+REMEMBER_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "remember",
+        "description": (
+            "役をまたいで絶対に忘れてはいけないと判断した事実・決定事項を、"
+            "全役共通の共有メモに書き残す。世間話や、その場限りの作業手順は書かないこと。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "note": {
+                    "type": "string",
+                    "description": "書き残す内容（短く、要点だけ）",
+                }
+            },
+            "required": ["note"],
+        },
+    },
+}
+
+RETURN_TO_CHAT_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "return_to_chat",
+        "description": (
+            "依頼された作業が完了し、これ以上コマンド実行やファイル編集が不要になったと"
+            "判断した時に呼ぶ。雑談役に会話を戻す。作業の途中で呼ばないこと。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "summary": {
+                    "type": "string",
+                    "description": (
+                        "何をして、結果がどうなったかの要約。"
+                        "雑談役はこの会話の履歴を見られないため、これだけ読んで"
+                        "ユーザーに説明できるように具体的に書くこと。"
+                    ),
+                }
+            },
+            "required": ["summary"],
+        },
+    },
+}
+
 TOOLS = [
+    REMEMBER_TOOL,
+    RETURN_TO_CHAT_TOOL,
     {
         "type": "function",
         "function": {
@@ -91,6 +139,43 @@ TOOLS = [
     },
 ]
 
+CHAT_TOOLS = [
+    REMEMBER_TOOL,
+    {
+        "type": "function",
+        "function": {
+            "name": "handoff_to_execute",
+            "description": (
+                "会話だけでは対応できず、実際にファイルの読み書きやコマンド実行が"
+                "必要な作業だと判断した時に呼ぶ。Execute役はこの会話の履歴を見られないため、"
+                "instructionsには何をしてほしいかを、それだけ読んで分かるように具体的に書くこと。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "instructions": {
+                        "type": "string",
+                        "description": "Execute役への具体的な作業指示（会話の要点をまとめたもの）",
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "なぜ雑談では対応できず引き継ぎが必要なのか",
+                    },
+                },
+                "required": ["instructions"],
+            },
+        },
+    },
+]
+
+
+def strip_think_blocks(text: str) -> str:
+    """<think>...</think> ブロック（reasoningモデルの思考過程）を取り除く。"""
+    cleaned = re.sub(r"<think>.*?</think>", "", text or "", flags=re.DOTALL | re.IGNORECASE)
+    cleaned = re.sub(r"<think>.*", "", cleaned, flags=re.DOTALL | re.IGNORECASE)
+    cleaned = cleaned.replace("</think>", "")
+    return cleaned.strip()
+
 
 def tool_calls_to_actions(tool_calls):
     """Ollamaのtool_callsを、既存のアクション辞書形式のリストに変換する。"""
@@ -126,39 +211,108 @@ def tool_calls_to_actions(tool_calls):
             if file_path:
                 actions.append({"type": "read", "file": file_path})
 
+        elif name == "remember":
+            note = args.get("note")
+            if isinstance(note, str) and note.strip():
+                actions.append({"type": "remember", "note": note.strip()})
+
     return actions
 
 
-def _extract_json_object(text):
-    """テキストからコードフェンスを剥がし、最初のJSONオブジェクトらしき範囲を取り出す。"""
+def _extract_json_objects(text):
+    """
+    テキストから、JSONオブジェクトらしき範囲を出てきた順に全て取り出す。
+    ```json ... ``` フェンスが1つ以上あればそれぞれの中身を対象にする。
+    フェンスが無ければ、波括弧の対応を数えてトップレベルの{...}を全て拾う
+    （「最初の{〜最後の}」方式だと、1つの返答に複数のJSONブロックが
+    並んだ時に全部まとめて壊れたJSONとして取れてしまうため）。
+    """
     text = text.strip()
-    fence = re.match(r"^```(?:json)?\s*(.*?)\s*```$", text, re.DOTALL)
-    if fence:
-        text = fence.group(1).strip()
-    start = text.find("{")
-    end = text.rfind("}")
-    if start == -1 or end == -1 or end <= start:
-        return None
-    return text[start:end + 1]
+    fenced = re.findall(r"```(?:json)?\s*(.*?)\s*```", text, re.DOTALL)
+    if fenced:
+        return [f.strip() for f in fenced if f.strip()]
+
+    objects = []
+    depth = 0
+    start = None
+    for i, ch in enumerate(text):
+        if ch == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "}":
+            if depth > 0:
+                depth -= 1
+                if depth == 0 and start is not None:
+                    objects.append(text[start:i + 1])
+                    start = None
+    return objects
 
 
 def tool_call_from_content(text):
     """
     tool_callsを返さず、{"name": ..., "arguments": {...}} 形式のJSONを
     contentにそのまま出力してしまうモデル向けの救済フォールバック。
-    該当しなければ None を返す。
+    1つの返答に複数のtool呼び出しJSONが並ぶこともあるため、見つかった
+    有効なもの全てをtool_calls形式のリストで返す。該当が無ければ None。
     """
-    candidate = _extract_json_object(text or "")
-    if not candidate:
-        return None
-    try:
-        obj = json.loads(candidate)
-    except (json.JSONDecodeError, TypeError):
-        return None
-    if not isinstance(obj, dict):
-        return None
-    name = obj.get("name")
-    args = obj.get("arguments")
-    if not name or not isinstance(args, dict):
-        return None
-    return [{"function": {"name": name, "arguments": args}}]
+    candidates = _extract_json_objects(strip_think_blocks(text))
+    tool_calls = []
+    for candidate in candidates:
+        try:
+            obj = json.loads(candidate)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if not isinstance(obj, dict):
+            continue
+        name = obj.get("name")
+        args = obj.get("arguments")
+        if not name or not isinstance(args, dict):
+            continue
+        tool_calls.append({"function": {"name": name, "arguments": args}})
+    return tool_calls or None
+
+
+def handoff_from_tool_calls(tool_calls):
+    """tool_callsからhandoff_to_executeの呼び出しを探し、{"instructions", "reason"}を返す。無ければNone。"""
+    for tc in tool_calls or []:
+        fn = tc.get("function", {})
+        if fn.get("name") != "handoff_to_execute":
+            continue
+        args = fn.get("arguments", {})
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except (json.JSONDecodeError, TypeError):
+                args = {}
+        if not isinstance(args, dict):
+            continue
+        instructions = args.get("instructions")
+        if not isinstance(instructions, str) or not instructions.strip():
+            continue
+        reason = args.get("reason", "")
+        if not isinstance(reason, str):
+            reason = ""
+        return {"instructions": instructions, "reason": reason}
+    return None
+
+
+def return_to_chat_from_tool_calls(tool_calls):
+    """tool_callsからreturn_to_chatの呼び出しを探し、{"summary"}を返す。無ければNone。"""
+    for tc in tool_calls or []:
+        fn = tc.get("function", {})
+        if fn.get("name") != "return_to_chat":
+            continue
+        args = fn.get("arguments", {})
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except (json.JSONDecodeError, TypeError):
+                args = {}
+        if not isinstance(args, dict):
+            continue
+        summary = args.get("summary")
+        if not isinstance(summary, str) or not summary.strip():
+            continue
+        return {"summary": summary}
+    return None

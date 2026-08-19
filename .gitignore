@@ -27,5 +27,6 @@ __pycache__/
 
 # エージェント実行時の生成物
 ollama_server.log
+chat_server.log
 debug_chat_log_*.txt
 *.bak
