@@ -105,19 +105,34 @@ def run_role_and_wait(server_proc, role_id, instructions, log_path):
 
 def _render_recent_turns(messages, limit=6):
     """
-    直近のuser/assistantの発言を、引き継ぎ先に渡す会話の参考情報として整形する。
+    直近の発言を、引き継ぎ先に渡す会話の参考情報として整形する。
     [NOTE] 以前は instructions（呼び出し元モデルが作った要約）だけを渡しており、
            実際の会話そのものは引き継ぎ先から一切見えなかった。要約は捏造や
            抜け漏れが起こりうるため、実データである直近の会話も併せて渡す。
+    [IMPORTANT] role=="tool" のメッセージ（他の役からの報告。例えば
+    Writer役が書いた記事本文そのもの）を除外していたため、「さっきWriterが
+    書いた記事を保存して」のような2段階の依頼で、Execute役に実際の記事
+    本文が渡らず、Execute役が内容を捏造してしまう不具合があった
+    （実機で確認済み）。tool役のメッセージも含める。
     """
-    turns = [m for m in messages if m.get("role") in ("user", "assistant") and m.get("content")]
+    turns = [
+        m for m in messages
+        if m.get("role") in ("user", "assistant", "tool") and m.get("content")
+    ]
     recent = turns[-limit:]
     lines = []
     for m in recent:
-        speaker = "ユーザー" if m["role"] == "user" else "雑談役"
         text = strip_think_blocks(m["content"])
-        if text:
-            lines.append(f"{speaker}: {text}")
+        if not text:
+            continue
+        if m["role"] == "user":
+            lines.append(f"ユーザー: {text}")
+        elif m["role"] == "assistant":
+            lines.append(f"雑談役: {text}")
+        else:
+            # tool役のcontentは "[xxx役からの報告]\n..." の形で既に自己説明的なため、
+            # 話者ラベルを付けずそのまま載せる。
+            lines.append(text)
     return "\n".join(lines)
 
 
