@@ -51,16 +51,21 @@ from scripts.tools import (
     tool_calls_to_actions,
     tool_call_from_content,
     return_to_caller_from_tool_calls,
+    handoff_from_tool_calls,
     strip_think_blocks,
 )
 from scripts.display import stream_chat_response
 from scripts.skills import web_search, fetch_url, summarize_text, calculate, git_diff_summary
 from scripts.role_loader import load_role
+from scripts.dispatch import invoke_role
 from scripts.memory import (
     start_session_log,
     append_session_log,
     append_shared_memory,
+    append_role_transition,
     build_system_prompt_with_memory,
+    render_recent_turns,
+    build_call_chain_notice,
 )
 
 # ==========================================
@@ -78,6 +83,21 @@ WORK_DIR = BASE_DIR
 CURRENT_MODE = "safe"
 
 _prev_len = [0]
+
+
+_FAILURE_TAG_RE = re.compile(r"^\s*\[[A-Z_ ]*(ERROR|FAILED)\]")
+
+
+def is_failure_feedback(text: str) -> bool:
+    """
+    行動の実行結果(feedback)が失敗を表すかを判定する。
+    このファイル・scripts/skills.pyのエラー文言はすべて
+    `[EDIT ERROR]`/`[EDIT FAILED]`/`[WRITE ERROR]`/`[READ ERROR]`/
+    `[API ERROR]`/`[SEARCH ERROR]`/`[FETCH ERROR]`/`[SUMMARIZE ERROR]`/
+    `[CALC ERROR]` のように「先頭が大文字の角括弧＋ERROR/FAILED」で
+    統一されているため、その形を見るだけで型を問わず判定できる。
+    """
+    return bool(_FAILURE_TAG_RE.match(text or ""))
 
 
 def clean_clixml_noise(text: str) -> str:
@@ -415,7 +435,7 @@ def start_interactive_chat(model_name: str, exec_mode: str, server_proc,
                            debug_mode: bool = False, raw_dump: bool = False,
                            initial_message: str = None, is_nested: bool = False,
                            num_ctx: int = 8192, log_path: str = None,
-                           role_id: str = None):
+                           role_id: str = None, call_chain: list = None):
     """
     このファイルの実装を使う役（既定はExecute役）のセッション本体。
 
@@ -438,9 +458,29 @@ def start_interactive_chat(model_name: str, exec_mode: str, server_proc,
     （execute用）なので、他の役がこのモジュールを共用する時は必ずrole_idを渡すこと。
     渡し忘れると、その役のtool制限（例: edit_fileを持たせない）が効かず、
     実際にはExecute役と同じ全toolが使えてしまう。
+
+    call_chain: ここまでの呼び出し履歴（役IDのリスト。例: ["chat", "plan"]）。
+    役同士が対等に呼び合える構造のため、無限にたらい回しが続く危険がある。
+    自分より前の履歴+自分自身をプロンプトに見せて「同じ役が既に出てきていないか」
+    をモデル自身に判断させ、かつ MAX_CALL_DEPTH を超えたらこの役自身は
+    handoff_to_roleを使えなくする（tool一覧から動的に外す）ことで、
+    プロンプトの指示が守られなくても物理的にループし得ないようにする。
     """
     role = load_role(BASE_DIR, role_id) if role_id else ROLE
     log_role_name = role_id or ROLE_ID
+    this_role_id = role_id or ROLE_ID
+    chain = list(call_chain or [])
+
+    # 呼び出し深さの上限。これを超えたら、この役はhandoff_to_role自体を
+    # 使えなくする（role["tools"]からその場で除外する）ことで、プロンプトの
+    # 指示（ループを避けろ）が守られなかった場合の物理的な保険にする。
+    MAX_CALL_DEPTH = 6
+    at_max_depth = len(chain) + 1 >= MAX_CALL_DEPTH
+    role_tools = role["tools"]
+    if at_max_depth:
+        role_tools = [t for t in role_tools if t["function"]["name"] != "handoff_to_role"]
+        print(f"\n[SYSTEM] 呼び出し階層が上限({MAX_CALL_DEPTH})に達しているため、"
+              f"この役ではhandoff_to_roleを無効化します。")
 
     warmup_model(model_name)
     if log_path is None:
@@ -477,7 +517,11 @@ def start_interactive_chat(model_name: str, exec_mode: str, server_proc,
         print("[MODE] ログモード有効（生ストリーム＋会話ファイル保存）")
     print("※ 終了: 'exit'/'quit' / 送信: 新しい行で 'EOF' か Ctrl+Z/Ctrl+D\n")
 
-    messages = [{"role": "system", "content": build_system_prompt_with_memory(role["prompt"], BASE_DIR)}]
+    system_prompt = build_system_prompt_with_memory(role["prompt"], BASE_DIR)
+    chain_notice = build_call_chain_notice(chain, this_role_id)
+    if chain_notice:
+        system_prompt = f"{system_prompt}\n\n{chain_notice}"
+    messages = [{"role": "system", "content": system_prompt}]
     print("[AI] 初期化が完了しました。質問をどうぞ。")
 
     MAX_AUTO_STEPS = 12
@@ -488,6 +532,11 @@ def start_interactive_chat(model_name: str, exec_mode: str, server_proc,
     # 連続検知」には引っかからなかった）。プロンプト側で軽減したが、プロンプトの
     # 指示追従は確率的で完全ではないため、コード側にも保険をかけておく。
     MAX_REMEMBER_STREAK = 2
+    # [NOTE] 実機テストで、Review役が実在しないファイルパスを毎回少しずつ
+    # 変えながら(read_fileの引数が違う=同一アクション連続検知に引っかからない)
+    # 12回リトライし続けた不具合を確認した。型が同じでも結果が失敗し続けて
+    # いれば、進捗が無いという意味では同一アクション連続と同じ暴走。
+    MAX_FAILURE_STREAK = 2
 
     # [IMPORTANT] 想定外の例外（バグ・EOFError等）でここから抜けた場合でも、
     # VRAM解放だけは必ず行う。既知の終了経路はそれぞれ自分でteardown()を
@@ -531,12 +580,13 @@ def start_interactive_chat(model_name: str, exec_mode: str, server_proc,
             last_action_signature = None
             same_action_count = 0
             remember_streak = 0
+            failure_streak = 0
 
             while True:
                 payload = json.dumps({
                     "model": model_name,
                     "messages": messages,
-                    "tools": role["tools"],
+                    "tools": role_tools,
                     "stream": True,
                     "keep_alive": KEEP_ALIVE,
                     "options": {
@@ -583,6 +633,65 @@ def start_interactive_chat(model_name: str, exec_mode: str, server_proc,
                 actions = tool_calls_to_actions(effective_tool_calls)
 
                 if not actions:
+                    # [NOTE] 役同士が対等に呼び合える構造では、この役自身も他の役へ
+                    # handoff_to_roleできる（role.jsonのcan_handoff_toで許可された
+                    # 範囲。呼び出し深さの上限に達していればtool一覧から動的に
+                    # 除外済みなので、at_max_depth時はここに来ない）。
+                    # actionsが無い時だけ見るのは、上と同じ「終端系のtool呼び出しを
+                    # 他より先にチェックすると、bundleされた時に本来やるべき
+                    # アクションが無言で消える」不具合を避けるため。
+                    handoff = handoff_from_tool_calls(effective_tool_calls) if not at_max_depth else None
+                    if handoff:
+                        target_role_id = handoff["role_id"]
+                        print(f"\n[HANDOFF] {target_role_id}役を呼び出します。理由: {handoff.get('reason') or '(不明)'}")
+                        append_role_transition(
+                            log_path, "handoff", this_role_id, target_role_id,
+                            f"理由: {handoff.get('reason') or '(不明)'}\n指示: {handoff['instructions']}",
+                        )
+
+                        context = render_recent_turns(messages)
+                        full_instructions = (
+                            f"[直前までの会話の抜粋（参考。要約ではなく実際のやり取り）]\n{context}\n\n"
+                            f"[今回の具体的な作業指示]\n{handoff['instructions']}"
+                        ) if context else handoff["instructions"]
+
+                        try:
+                            sub_summary = invoke_role(
+                                BASE_DIR, target_role_id, server_proc, full_instructions, log_path,
+                                call_chain=chain + [this_role_id],
+                            )
+                        except Exception as e:
+                            print(f"\n[ERROR] {target_role_id}役の実行中に問題が発生しました: {e}")
+                            sub_summary = f"{target_role_id}役の実行中にエラーが発生し、中断しました: {e}"
+                        finally:
+                            # invoke_role側で自分のモデルは既にアンロード済みなので、
+                            # ここで自分のモデルを再ロードしてから続行する
+                            # （chat_agent.pyのrun_role_and_waitと同じパターン）。
+                            warmup_model(model_name)
+
+                        append_role_transition(log_path, "return", target_role_id, this_role_id, sub_summary or "(報告なし)")
+                        if sub_summary:
+                            note = f"[{target_role_id}役からの報告]\n{sub_summary}"
+                            messages.append({"role": "tool", "content": note})
+                            print(f"\n{note}\n")
+
+                        # 物理防御2と同じ扱い: handoffも1ステップとして数える
+                        # （でなければ「呼び合うだけで何もしない」連鎖がauto_stepsを
+                        # 消費せずに続いてしまう）。
+                        auto_steps += 1
+                        if auto_steps >= MAX_AUTO_STEPS:
+                            print(f"\n[SYSTEM] 物理防御作動: 自動実行が上限({MAX_AUTO_STEPS}回)到達。強制停止します。")
+                            report = sub_summary or f"自動実行が上限({MAX_AUTO_STEPS}回)に達したため、途中で強制停止しました。"
+                            if is_nested:
+                                print("\n[RETURN] 自動実行の上限に達したため、呼び出し元に会話を戻します。")
+                                append_session_log(log_path, "System", f"上限到達により呼び出し元に戻る: {report}")
+                                cleaned_up = True
+                                return teardown(report)
+                            break
+
+                        print("\n[SYSTEM] 引き継ぎ結果をAIにフィードバックして解析中...")
+                        continue
+
                     return_info = return_to_caller_from_tool_calls(effective_tool_calls)
                     if return_info:
                         cleaned_up = True
@@ -708,6 +817,34 @@ def start_interactive_chat(model_name: str, exec_mode: str, server_proc,
                 if chat_log_file:
                     with open(chat_log_file, "a", encoding="utf-8") as f:
                         f.write(f"\n[Action Results]\n{feedback}\n")
+
+                # 物理防御1.7: 失敗連続検知（型は同じでも引数を変えながら
+                # 失敗し続けるハルシネーション連投を検知する。実機で
+                # Review役がread_fileの存在しないパスを毎回微妙に変えながら
+                # 12回リトライし続けた不具合を確認した。同一アクション連続検知
+                # (物理防御1)は引数が完全一致でないと発動しないため、このケースは
+                # すり抜けていた）。
+                if is_failure_feedback(feedback):
+                    failure_streak += 1
+                else:
+                    failure_streak = 0
+
+                if failure_streak >= MAX_FAILURE_STREAK:
+                    print(f"\n[SYSTEM] 物理防御作動: 同じ種類の操作が{MAX_FAILURE_STREAK}回連続で失敗。強制停止します。")
+                    messages.append({
+                        "role": "user",
+                        "content": "[SYSTEM NOTICE] 同じ種類の操作が連続して失敗しています。"
+                                   "存在しないパスを推測で試すのをやめ、別の方法を試すか、"
+                                   "これ以上できることが無ければreturn_to_callerで"
+                                   "ここまでの状況を具体的に報告してください。"
+                    })
+                    report = _final_report(messages, model_name, debug_mode, chat_log_file)
+                    if is_nested:
+                        print("\n[RETURN] 失敗の連投を検知したため、呼び出し元に会話を戻します。")
+                        append_session_log(log_path, "System", f"失敗連投検知により呼び出し元に戻る: {report}")
+                        cleaned_up = True
+                        return teardown(report or "同じ種類の操作が失敗し続けたため、途中で強制停止しました。")
+                    break
 
                 # 物理防御2: 自動継続の絶対上限
                 auto_steps += 1

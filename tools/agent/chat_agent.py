@@ -53,6 +53,7 @@ from scripts.memory import (
     append_role_transition,
     append_shared_memory,
     build_system_prompt_with_memory,
+    render_recent_turns,
 )
 
 # 思考モデルは、日本語Windowsのコンソール既定(cp932)では表示できない文字
@@ -92,48 +93,20 @@ def run_role_and_wait(server_proc, role_id, instructions, log_path):
     戻ってきたら自分(雑談役)のモデルを再ロードする。
     呼び出し先が例外で落ちても、ここで捕まえて会話は継続させる。
     戻り値: 呼び出し先からの報告（要約文字列）。無ければNone。
+
+    [NOTE] call_chain=["chat"] を渡す。雑談役は呼び出し連鎖の常に起点(0番目)
+    であり、他の役から呼び返される対象にはならない（moduleを持たないため
+    invoke_roleの呼び出し先にもなれない）。役同士が対等に呼び合える構造に
+    なったため、この最初の1段だけは雑談役側でマークしておく必要がある。
     """
     try:
-        summary = invoke_role(BASE_DIR, role_id, server_proc, instructions, log_path)
+        summary = invoke_role(BASE_DIR, role_id, server_proc, instructions, log_path, call_chain=["chat"])
     except Exception as e:
         print(f"\n[ERROR] {role_id}役の実行中に問題が発生しました: {e}")
         summary = f"{role_id}役の実行中にエラーが発生し、中断しました: {e}"
     finally:
         warmup_model(CHAT_MODEL)
     return summary
-
-
-def _render_recent_turns(messages, limit=6):
-    """
-    直近の発言を、引き継ぎ先に渡す会話の参考情報として整形する。
-    [NOTE] 以前は instructions（呼び出し元モデルが作った要約）だけを渡しており、
-           実際の会話そのものは引き継ぎ先から一切見えなかった。要約は捏造や
-           抜け漏れが起こりうるため、実データである直近の会話も併せて渡す。
-    [IMPORTANT] role=="tool" のメッセージ（他の役からの報告。例えば
-    Writer役が書いた記事本文そのもの）を除外していたため、「さっきWriterが
-    書いた記事を保存して」のような2段階の依頼で、Execute役に実際の記事
-    本文が渡らず、Execute役が内容を捏造してしまう不具合があった
-    （実機で確認済み）。tool役のメッセージも含める。
-    """
-    turns = [
-        m for m in messages
-        if m.get("role") in ("user", "assistant", "tool") and m.get("content")
-    ]
-    recent = turns[-limit:]
-    lines = []
-    for m in recent:
-        text = strip_think_blocks(m["content"])
-        if not text:
-            continue
-        if m["role"] == "user":
-            lines.append(f"ユーザー: {text}")
-        elif m["role"] == "assistant":
-            lines.append(f"雑談役: {text}")
-        else:
-            # tool役のcontentは "[xxx役からの報告]\n..." の形で既に自己説明的なため、
-            # 話者ラベルを付けずそのまま載せる。
-            lines.append(text)
-    return "\n".join(lines)
 
 
 def run_chat_loop(model_name, server_proc, log_path):
@@ -234,7 +207,7 @@ def run_chat_loop(model_name, server_proc, log_path):
                     f"理由: {handoff.get('reason') or '(不明)'}\n指示: {handoff['instructions']}",
                 )
 
-                context = _render_recent_turns(messages)
+                context = render_recent_turns(messages)
                 full_instructions = (
                     f"[直前までの会話の抜粋（参考。要約ではなく実際のやり取り）]\n{context}\n\n"
                     f"[今回の具体的な作業指示]\n{handoff['instructions']}"
