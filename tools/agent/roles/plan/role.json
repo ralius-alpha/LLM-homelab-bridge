@@ -4,5 +4,5 @@
   "model": "qwen2.5-coder:14b",
   "tools": ["read_file", "search_web", "remember", "return_to_caller"],
   "module": "arc_agent",
-  "can_handoff_to": []
+  "can_handoff_to": ["execute", "review", "writer", "debug", "test"]
 }
