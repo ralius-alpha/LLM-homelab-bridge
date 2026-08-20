@@ -16,7 +16,8 @@
 
     def start_interactive_chat(model_name, exec_mode, server_proc, *,
                                 initial_message=None, is_nested=False,
-                                log_path=None, role_id=None, **kwargs): ...
+                                log_path=None, role_id=None,
+                                call_chain=None, **kwargs): ...
 
        戻り値: 呼び出し元への報告文字列（return_to_callerが呼ばれた場合）、
               それ以外の終了ならNone。
@@ -25,6 +26,13 @@
        roles/execute と roles/review が両方とも arc_agent.py を使うが、
        tool一覧やプロンプトは別）。実装側はrole_idを見て、モジュール内で
        決め打ちにせず roles/<role_id>/ の定義を都度読み込むこと。
+
+       call_chain: ここまでの呼び出し履歴（role_idのリスト。例:
+       ["chat", "plan"]）。役同士が対等に呼び合える構造では、無限に
+       たらい回しが続く危険があるため、実装側は「自分が何代目か」
+       「誰から呼ばれてここに至ったか」をプロンプトに見せ、かつ一定の深さを
+       超えたらhandoff_to_role自体を使えなくする、といった安全策を持つこと
+       （arc_agent.pyの実装を参照）。
 """
 
 import importlib
@@ -33,7 +41,7 @@ from scripts.role_loader import load_role
 from scripts.ollama import unload_all_models
 
 
-def invoke_role(base_dir, role_id, server_proc, instructions, log_path):
+def invoke_role(base_dir, role_id, server_proc, instructions, log_path, call_chain=None):
     """
     role_idの役を入れ子で呼び出し、終わるまで待つ。
     呼び出す前に自分のモデルをアンロードするのは呼び出し元の責任
@@ -56,5 +64,5 @@ def invoke_role(base_dir, role_id, server_proc, instructions, log_path):
     return entry(
         role["model"], "safe", server_proc,
         initial_message=instructions, is_nested=True, log_path=log_path,
-        role_id=role_id,
+        role_id=role_id, call_chain=call_chain,
     )
