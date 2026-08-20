@@ -114,9 +114,13 @@ Aのプロンプトの末尾にも「自分の専門性はこれ、それ以外�
   ```python
   def start_interactive_chat(model_name, exec_mode, server_proc, *,
                               initial_message=None, is_nested=False,
-                              log_path=None, role_id=None, **kwargs): ...
+                              log_path=None, role_id=None,
+                              call_chain=None, **kwargs): ...
   # 戻り値: return_to_callerが呼ばれれば要約文字列、それ以外の終了ならNone
   ```
+  `call_chain=None` を必ず受け取ること（後述「対等な呼び出しと呼び出し深さの
+  上限」参照）。省略時は空扱いになるが、`invoke_role()`から渡された場合は
+  そのままここまでの呼び出し履歴（役IDのリスト）が入っている。
   [IMPORTANT] `role_id`は「複数の役が同じモジュールを共用できる」ようにするための
   引数。実装側はモジュール読み込み時に固定されたグローバルなroleを常に使うのではなく、
   `role_id`が渡されたらそちらの`roles/<role_id>/`定義を都度読み込むこと（`arc_agent.py`
@@ -151,25 +155,45 @@ python chat_agent.py
 
 ---
 
-## 全体の流れ（入れ子構造）
+## 全体の流れ（入れ子構造・対等な呼び出し）
+
+雑談役だけが引き継ぎを開始できるわけではない。**どの役も、`can_handoff_to`に
+列挙された他のどの役へも`handoff_to_role`で引き継げる**（現状はchat以外の
+6役が互いに全員へ引き継げる、完全に対等なグラフ）。雑談役だけが特別なのは
+「必ず連鎖の起点(0代目)になる」という1点だけで、雑談役自身が他の役から
+`handoff_to_role`で呼ばれることは無い（`roles/chat/role.json`に`module`が
+無く、引き継ぎ先の実装を持たないため）。
 
 ```
 main() in chat_agent.py
-  └─ run_chat_loop()                       ← 雑談役。ユーザーと直接対話する
+  └─ run_chat_loop()                       ← 雑談役。ユーザーと直接対話する。連鎖の起点(0代目)
        │  ユーザーの要望が実作業を要すると判断
        │  handoff_to_role(role_id="execute") が呼ばれる
        │  直近の会話の抜粋（要約ではなく実データ）を instructions に添えて渡す
+       │  call_chain=["chat"] を invoke_role() に渡す
        ▼
      run_role_and_wait() → scripts.dispatch.invoke_role()
        │  自分(雑談役)のモデルをVRAMから解放
        │  role.jsonの"module"を見てimportlibで動的import
        ▼
-     arc_agent.start_interactive_chat(is_nested=True, log_path=共通ログ)  ← Execute役。同じプロセス
+     arc_agent.start_interactive_chat(is_nested=True, log_path=共通ログ,
+                                       role_id="execute", call_chain=["chat"])  ← Execute役。同じプロセス
        │  コマンド実行・ファイル編集を行う（雑談役と同じログファイルに追記）
-       │  作業完了と判断
+       │  自分の専門外の確認（レビュー等）が必要だと自分で判断
+       │  handoff_to_role(role_id="review") が呼ばれる
+       │  arc_agent.py自身のhandoff-dispatchが受け取り、
+       │  call_chain=["chat","execute"] を渡してinvoke_role()を再帰的に呼ぶ
+       ▼
+     arc_agent.start_interactive_chat(..., role_id="review",
+                                       call_chain=["chat","execute"])  ← Review役。さらに入れ子
+       │  ファイルを読んで確認
        │  return_to_caller が呼ばれる → 要約文字列を return
        ▼
-     invoke_role() に戻ってくる
+     Execute役の中のhandoff-dispatchに戻ってくる
+       │  Review役の報告を「[review役からの報告]」として会話に注入し継続
+       │  作業完了と判断、return_to_caller が呼ばれる → 要約文字列を return
+       ▼
+     invoke_role() に戻ってくる（雑談役側）
        │  Execute役のモデルは自分の中でVRAM解放済み
        │  雑談役のモデルを再ロード
        ▼
@@ -178,7 +202,29 @@ main() in chat_agent.py
 
 引き継ぎ先の`start_interactive_chat()`は普通のPython関数で、呼ばれたら実行し、
 終わったら（`return_to_caller` が呼ばれるか、単に終了すれば）呼び出し元に戻ってくる。
-別プロセスを起動することも、何かを `kill` することも一切ない。
+別プロセスを起動することも、何かを `kill` することも一切ない。「雑談→execute→雑談」
+のような1段階の流れも、上記の一般化された仕組みの特殊ケース（連鎖の深さが1）として
+自然に内包される。
+
+### 対等な呼び出しと呼び出し深さの上限（`call_chain` / `MAX_CALL_DEPTH`）
+
+役同士が自由に呼び合える構造にすると、AとBが互いを呼び合い続ける等の
+堂々巡りが原理的にありうる。これに対して二重の防御をかけている:
+
+1. **プロンプトでの抑制**: `call_chain`（ここまでの呼び出し履歴。役IDのリスト）
+   を`scripts/memory.py`の`build_call_chain_notice()`が「呼び出し履歴:
+   chat → execute → review（あなたはreview、3代目）」のような形に整形し、
+   各役のシステムプロンプト末尾に自動注入する。同じ役が既に履歴に出ている
+   場合は`handoff_to_role`を使わず`return_to_caller`で報告するよう、
+   各役の`prompt.txt`にも明記している。
+2. **コード側のハード上限**: `arc_agent.py`の`start_interactive_chat()`が
+   `MAX_CALL_DEPTH = 6`を超えたら、その役の`role_tools`から`handoff_to_role`
+   自体をその場で除外する（`role["tools"]`は変えず、Ollamaに渡すtool一覧だけ
+   絞る）。プロンプトの指示が守られなくても、それ以上は物理的に引き継げない。
+
+これは今夜このプロジェクトでずっと採ってきた「プロンプトでの軽減＋コードでの
+保険」という方針の延長（既存の`MAX_AUTO_STEPS`/`MAX_SAME_ACTION`/
+`MAX_REMEMBER_STREAK`/`MAX_FAILURE_STREAK`と同じ考え方）。
 
 ### なぜプロセスを分けず、この形にしたか
 
@@ -620,6 +666,32 @@ Plan/Writer/Debug/Test役を追加した際の実機テストで、Debug役が`e
 必ずtool呼び出し機能そのものを使うこと」という一文を追加したところ、再現
 テストでは解消した。ただし1回の再現テストで直っただけであり、統計的に
 解消したとまでは言えない。小型モデルの既知の不安定要素として引き続き注意する。
+
+### 雑談役がプレースホルダー付きのままhandoff_to_roleを呼ぶ（修正済み）
+
+雑談役がユーザーの「自分のコードをレビューして」的な依頼に対し、対象コードが
+まだ会話に出ていないにもかかわらず、`instructions`に「[ここにコードを貼り付ける]」
+のような未置換のプレースホルダー文字列を入れたまま`handoff_to_role(role_id="review")`
+を呼んでしまった事例を実機で確認した。引き継がれたReview役はこのプレースホルダーを
+実在するファイルパスだと誤解し、存在しないパスをわずかに変えながら12回リトライし
+続け、`MAX_AUTO_STEPS`（当時の`MAX_SAME_ACTION`は引数が毎回違うため反応しなかった）
+に達してようやく止まった。
+
+`roles/chat/prompt.txt`に、プレースホルダーを含めたまま引き継がないこと、対象の
+具体的な内容（ファイルパス・コード本文等）がまだ無い場合は引き継がずに先に
+ユーザーへ聞き返すこと、を明記して対策した。
+
+### 型は同じだが引数だけ変えて失敗し続けるループが検知されない（修正済み）
+
+上記の事例が引き金になった、より一般的な不具合。既存の`same_action_count`
+（tool名+引数の完全一致を検知）は、引数が毎回微妙に違う（例: 存在しない
+ファイルパスを少しずつ変える）と反応しない。`arc_agent.py`に
+`is_failure_feedback()`（`[...ERROR]`/`[...FAILED]`等の失敗マーカーで
+始まるかを判定）と`MAX_FAILURE_STREAK = 2`を追加し、tool名や引数が
+違っていても「直近の結果が失敗続きで進捗が無い」状態そのものを検知して
+強制停止するようにした。既存の`same_action_count`/`remember_streak`と
+同じ「型ベースの繰り返し検知」の系列に、「結果ベースの繰り返し検知」を
+1つ加えた形。
 
 ---
 
