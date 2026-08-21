@@ -45,7 +45,7 @@ from scripts.tools import (
     handoff_from_tool_calls,
 )
 from scripts.display import stream_chat_response
-from scripts.role_loader import load_role, roles_providing_tool
+from scripts.role_loader import load_role, roles_providing_tool, role_tool_names
 from scripts.dispatch import invoke_role
 from scripts.memory import (
     start_session_log,
@@ -54,6 +54,7 @@ from scripts.memory import (
     append_shared_memory,
     build_system_prompt_with_memory,
     render_recent_turns,
+    build_handoff_brief,
 )
 
 # 思考モデルは、日本語Windowsのコンソール既定(cp932)では表示できない文字
@@ -160,7 +161,7 @@ def _looks_like_unfulfilled_handoff(text: str) -> bool:
     return any(pattern in text for pattern in _HANDOFF_INTENT_PATTERNS)
 
 
-def run_role_and_wait(server_proc, role_id, instructions, log_path):
+def run_role_and_wait(server_proc, role_id, instructions, log_path, root_request=None):
     """
     role_idの役を invoke_role 経由で入れ子呼び出しし、終わるまで待つ。
     戻ってきたら自分(雑談役)のモデルを再ロードする。
@@ -173,7 +174,8 @@ def run_role_and_wait(server_proc, role_id, instructions, log_path):
     なったため、この最初の1段だけは雑談役側でマークしておく必要がある。
     """
     try:
-        summary = invoke_role(BASE_DIR, role_id, server_proc, instructions, log_path, call_chain=["chat"])
+        summary = invoke_role(BASE_DIR, role_id, server_proc, instructions, log_path,
+                              call_chain=["chat"], root_request=root_request)
     except Exception as e:
         print(f"\n[ERROR] {role_id}役の実行中に問題が発生しました: {e}")
         summary = f"{role_id}役の実行中にエラーが発生し、中断しました: {e}"
@@ -361,13 +363,15 @@ def run_chat_loop(model_name, server_proc, log_path):
                     f"理由: {handoff.get('reason') or '(不明)'}\n指示: {handoff['instructions']}",
                 )
 
-                context = render_recent_turns(messages)
-                full_instructions = (
-                    f"[直前までの会話の抜粋（参考。要約ではなく実際のやり取り）]\n{context}\n\n"
-                    f"[今回の具体的な作業指示]\n{handoff['instructions']}"
-                ) if context else handoff["instructions"]
+                full_instructions = build_handoff_brief(
+                    role_tool_names(BASE_DIR, role_id),
+                    user_input,
+                    render_recent_turns(messages),
+                    handoff["instructions"],
+                )
 
-                summary = run_role_and_wait(server_proc, role_id, full_instructions, log_path)
+                summary = run_role_and_wait(server_proc, role_id, full_instructions,
+                                            log_path, root_request=user_input)
 
                 append_role_transition(log_path, "return", role_id, "chat", summary or "(報告なし)")
                 if summary:

@@ -17,7 +17,7 @@
     def start_interactive_chat(model_name, exec_mode, server_proc, *,
                                 initial_message=None, is_nested=False,
                                 log_path=None, role_id=None,
-                                call_chain=None, **kwargs): ...
+                                call_chain=None, root_request=None, **kwargs): ...
 
        戻り値: 呼び出し元への報告文字列（return_to_callerが呼ばれた場合）、
               それ以外の終了ならNone。
@@ -33,6 +33,12 @@
        「誰から呼ばれてここに至ったか」をプロンプトに見せ、かつ一定の深さを
        超えたらhandoff_to_role自体を使えなくする、といった安全策を持つこと
        （arc_agent.pyの実装を参照）。
+
+       root_request: ユーザーが最初に出した依頼の原文。引き継ぎのたびに
+       instructionsは各役のモデルが書き直すため、連鎖が深くなるほど元の依頼から
+       ずれていく（実機で「今日の東京の天気」→「最新の天気情報」→
+       「適切なAPIを呼び出して」と変質するのを確認）。原文だけは書き換えずに
+       持ち回り、引き継ぎ指示書に併記する（scripts.memory.build_handoff_brief）。
 """
 
 import importlib
@@ -41,12 +47,18 @@ from scripts.role_loader import load_role
 from scripts.ollama import unload_all_models
 
 
-def invoke_role(base_dir, role_id, server_proc, instructions, log_path, call_chain=None):
+def invoke_role(base_dir, role_id, server_proc, instructions, log_path,
+                call_chain=None, root_request=None):
     """
     role_idの役を入れ子で呼び出し、終わるまで待つ。
     呼び出す前に自分のモデルをアンロードするのは呼び出し元の責任
     （invoke_role自身は「何のモデルを呼び出し元が使っていたか」を知らない）。
     戻り値: 呼び出された役からの報告（要約文字列）。無ければNone。
+
+    root_request: ユーザーが最初に出した依頼の原文。引き継ぎのたびに
+    instructionsがモデルの言い換えで書き換わり、元の依頼から乖離していくため
+    （実機で「今日の東京の天気」→「最新の天気情報」→「適切なAPIを呼び出して」と
+    変質するのを確認）、原文だけは書き換えずに連鎖の最後まで持ち回る。
     """
     role = load_role(base_dir, role_id)
     module_name = role.get("module")
@@ -64,5 +76,5 @@ def invoke_role(base_dir, role_id, server_proc, instructions, log_path, call_cha
     return entry(
         role["model"], "safe", server_proc,
         initial_message=instructions, is_nested=True, log_path=log_path,
-        role_id=role_id, call_chain=call_chain,
+        role_id=role_id, call_chain=call_chain, root_request=root_request,
     )

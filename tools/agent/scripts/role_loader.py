@@ -31,6 +31,23 @@ ROLE_CONFIG_FILENAME = "role.json"
 ROLE_PROMPT_FILENAME = "prompt.txt"
 
 
+def role_tool_names(base_dir, role_id):
+    """
+    role_id が role.json で宣言しているtool名の一覧を返す（読み込みに失敗したら空）。
+    引き継ぎ指示書の冒頭に「引き継ぎ先自身の能力」を明記するために使う
+    （scripts.memory.build_handoff_brief 参照）。
+    can_handoff_to があれば handoff_to_role も実際には使えるので併せて載せる。
+    """
+    try:
+        meta = _peek_role_meta(base_dir, role_id)
+    except (OSError, ValueError):
+        return []
+    names = list(meta.get("tools", []))
+    if meta.get("can_handoff_to"):
+        names.append("handoff_to_role")
+    return names
+
+
 def roles_providing_tool(base_dir, role_ids, tool_name):
     """
     role_ids の中から、tool_name を実際に持っている役のIDだけを返す。
@@ -76,6 +93,7 @@ def _peek_role_meta(base_dir, role_id):
         "display_name": config.get("display_name", role_id),
         "specialty": config.get("specialty", ""),
         "tools": config.get("tools", []),
+        "can_handoff_to": config.get("can_handoff_to", []),
     }
 
 

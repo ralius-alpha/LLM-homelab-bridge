@@ -56,7 +56,7 @@ from scripts.tools import (
 )
 from scripts.display import stream_chat_response
 from scripts.skills import web_search, fetch_url, summarize_text, calculate, git_diff_summary
-from scripts.role_loader import load_role
+from scripts.role_loader import load_role, role_tool_names
 from scripts.dispatch import invoke_role
 from scripts.memory import (
     start_session_log,
@@ -66,6 +66,7 @@ from scripts.memory import (
     build_system_prompt_with_memory,
     render_recent_turns,
     build_call_chain_notice,
+    build_handoff_brief,
 )
 
 # ==========================================
@@ -435,7 +436,8 @@ def start_interactive_chat(model_name: str, exec_mode: str, server_proc,
                            debug_mode: bool = False, raw_dump: bool = False,
                            initial_message: str = None, is_nested: bool = False,
                            num_ctx: int = 8192, log_path: str = None,
-                           role_id: str = None, call_chain: list = None):
+                           role_id: str = None, call_chain: list = None,
+                           root_request: str = None):
     """
     このファイルの実装を使う役（既定はExecute役）のセッション本体。
 
@@ -477,10 +479,26 @@ def start_interactive_chat(model_name: str, exec_mode: str, server_proc,
     MAX_CALL_DEPTH = 6
     at_max_depth = len(chain) + 1 >= MAX_CALL_DEPTH
     role_tools = role["tools"]
+    depth_notice = None
     if at_max_depth:
         role_tools = [t for t in role_tools if t["function"]["name"] != "handoff_to_role"]
         print(f"\n[SYSTEM] 呼び出し階層が上限({MAX_CALL_DEPTH})に達しているため、"
               f"この役ではhandoff_to_roleを無効化します。")
+        # [IMPORTANT] toolを外すだけでは足りない。実機で、外された後も
+        # handoff_to_roleのJSONを出し続け（何も実行されない）、結局ユーザーには
+        # 「できません」しか返らないまま連鎖が終わるのを確認した。
+        # 「もう引き継げないので自分で完結させて報告しろ」と明示する。
+        depth_notice = (
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "【重要: これ以上ほかの役に引き継げません】\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "呼び出し階層が上限に達したため、handoff_to_roleはあなたのtool一覧から"
+            "外されています。呼び出そうとしても何も実行されません。\n"
+            "自分が持っているtoolでできる範囲を実行し、必ずreturn_to_callerで"
+            "結果を報告してください。できない部分があれば「何ができて何ができ"
+            "なかったか」をsummaryに具体的に書くこと。何も報告せずに終わるのが"
+            "最も避けるべき結果です。"
+        )
 
     warmup_model(model_name)
     if log_path is None:
@@ -521,6 +539,8 @@ def start_interactive_chat(model_name: str, exec_mode: str, server_proc,
     chain_notice = build_call_chain_notice(chain, this_role_id)
     if chain_notice:
         system_prompt = f"{system_prompt}\n\n{chain_notice}"
+    if depth_notice:
+        system_prompt = f"{system_prompt}\n\n{depth_notice}"
     messages = [{"role": "system", "content": system_prompt}]
     print("[AI] 初期化が完了しました。質問をどうぞ。")
 
@@ -680,16 +700,17 @@ def start_interactive_chat(model_name: str, exec_mode: str, server_proc,
                             f"理由: {handoff.get('reason') or '(不明)'}\n指示: {handoff['instructions']}",
                         )
 
-                        context = render_recent_turns(messages)
-                        full_instructions = (
-                            f"[直前までの会話の抜粋（参考。要約ではなく実際のやり取り）]\n{context}\n\n"
-                            f"[今回の具体的な作業指示]\n{handoff['instructions']}"
-                        ) if context else handoff["instructions"]
+                        full_instructions = build_handoff_brief(
+                            role_tool_names(BASE_DIR, target_role_id),
+                            root_request,
+                            render_recent_turns(messages),
+                            handoff["instructions"],
+                        )
 
                         try:
                             sub_summary = invoke_role(
                                 BASE_DIR, target_role_id, server_proc, full_instructions, log_path,
-                                call_chain=chain + [this_role_id],
+                                call_chain=chain + [this_role_id], root_request=root_request,
                             )
                         except Exception as e:
                             print(f"\n[ERROR] {target_role_id}役の実行中に問題が発生しました: {e}")

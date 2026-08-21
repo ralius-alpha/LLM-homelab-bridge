@@ -96,6 +96,75 @@ def build_system_prompt_with_memory(base_prompt, base_dir):
     )
 
 
+# コード側がモデルを促すために差し込む内部指示の目印。
+# この目印で始まるメッセージは、引き継ぎ先に渡す抜粋には含めない。
+SYSTEM_NOTICE_PREFIX = "[SYSTEM NOTICE]"
+
+# 引き継ぎ指示書(build_handoff_brief)の各セクションの見出し。
+# 指示書を抜粋に載せる時は、最後の「作業指示」だけに畳む（_flatten_handoff_brief）。
+BRIEF_CAPABILITY_HEADER = "[あなたが使えるtool]"
+BRIEF_ROOT_REQUEST_HEADER = "[ユーザーの当初の依頼（原文）]"
+BRIEF_EXCERPT_HEADER = "[直前までの会話の抜粋（参考。要約ではなく実際のやり取り）]"
+BRIEF_INSTRUCTION_HEADER = "[今回の具体的な作業指示]"
+
+
+def _flatten_handoff_brief(text):
+    """
+    引き継ぎ指示書を、その中の「今回の具体的な作業指示」だけに畳む。
+
+    [IMPORTANT] 引き継ぎ先の役のmessagesは、先頭のuserメッセージが
+    「指示書まるごと」になっている。それをそのまま次の引き継ぎの抜粋に
+    載せると、指示書の中に前の指示書が入り、その中にまた前の指示書が…と
+    再帰的に入れ子になる（実機で5重の入れ子を確認）。
+    指示書のうち後続の役にとって意味があるのは「何をしてほしいか」だけなので、
+    最後の作業指示セクション以降だけを残す。
+    """
+    if not text or BRIEF_INSTRUCTION_HEADER not in text:
+        return text
+    return text.rsplit(BRIEF_INSTRUCTION_HEADER, 1)[1].strip()
+
+
+def build_handoff_brief(target_tool_names, root_request, context, instructions):
+    """
+    引き継ぎ先に渡す指示書を組み立てる。chat_agent.py と arc_agent.py の
+    両方がこれを使う（以前は各々が同じ文字列連結を持っていた）。
+
+    [IMPORTANT] 冒頭に「引き継ぎ先自身のtool一覧」を明記するのが要点。
+    実機で、search_webを持っている review→execute→debug の3役が揃って
+    「私は直接search_webを呼び出す能力を持っていません」と言ってたらい回しに
+    する暴走を確認した。原因は、抜粋に含まれる【前の役の「できません」という
+    発言】を、受け取った役が自分の発言として真似てしまうこと（tool呼び出しJSONの
+    丸写しと同じ構造の、文章版）。自分の能力を先に突きつけ、抜粋中の他役の
+    自己申告は自分には当てはまらないと明示することで打ち消す。
+
+    root_request（ユーザーの当初の依頼の原文）も併せて渡す。引き継ぎのたびに
+    instructionsがモデルの言い換えで書き換わり、元の依頼から乖離していく
+    （「今日の東京の天気」→「最新の天気情報」→「適切なAPIを呼び出して」）
+    のを防ぐため、原文だけは書き換えずに持ち回る。
+    """
+    parts = []
+    if target_tool_names:
+        parts.append(
+            f"{BRIEF_CAPABILITY_HEADER}\n"
+            f"{', '.join(target_tool_names)}\n"
+            "※この一覧があなたの能力そのもの。下の抜粋に出てくる他の役の"
+            "「〜できません」「〜する能力を持っていません」といった発言は、"
+            "その役についての話であって、あなたには当てはまらない。"
+            "真似して同じことを言わず、必ず自分のtool一覧を見て判断すること。"
+            "この一覧に必要なtoolがあるなら、引き継がずに自分で実行すること。"
+        )
+    if root_request:
+        parts.append(
+            f"{BRIEF_ROOT_REQUEST_HEADER}\n{root_request}\n"
+            "※これが最終的に満たすべき依頼。途中の役が言い換えた指示より、"
+            "この原文を優先して解釈すること。"
+        )
+    if context:
+        parts.append(f"{BRIEF_EXCERPT_HEADER}\n{context}")
+    parts.append(f"{BRIEF_INSTRUCTION_HEADER}\n{instructions}")
+    return "\n\n".join(parts)
+
+
 def render_recent_turns(messages, limit=6):
     """
     直近の発言を、引き継ぎ先に渡す会話の参考情報として整形する。
@@ -111,6 +180,12 @@ def render_recent_turns(messages, limit=6):
     [IMPORTANT] 生のtool呼び出しJSONは strip_tool_call_json() で落とす。
     残したままにすると、引き継ぎ先の役がそれを丸写しして同じtool呼び出しを
     繰り返す（実機で execute→execute の自己引き継ぎ暴走を確認）。
+
+    [IMPORTANT] SYSTEM NOTICE（コード側がモデルを促すために差し込む内部指示）と、
+    過去の引き継ぎ指示書そのものは、抜粋に含めない/畳む。含めたままにすると、
+    引き継ぎのたびに指示書が入れ子で積み重なり（実機で
+    「[直前までの会話の抜粋]」が5重に入れ子になるのを確認）、文脈が
+    指数的に汚れる。詳細は _flatten_handoff_brief を参照。
     """
     turns = [
         m for m in messages
@@ -119,7 +194,12 @@ def render_recent_turns(messages, limit=6):
     recent = turns[-limit:]
     lines = []
     for m in recent:
-        text = strip_tool_call_json(strip_think_blocks(m["content"]))
+        raw = m["content"]
+        # コード側が差し込んだ内部指示は、他の役に見せる情報ではない。
+        if raw.lstrip().startswith(SYSTEM_NOTICE_PREFIX):
+            continue
+        text = _flatten_handoff_brief(raw)
+        text = strip_tool_call_json(strip_think_blocks(text))
         if not text:
             continue
         if m["role"] == "user":
