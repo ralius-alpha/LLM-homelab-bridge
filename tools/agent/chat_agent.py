@@ -24,6 +24,7 @@
 """
 
 import os
+import re
 import sys
 import json
 import urllib.request
@@ -45,6 +46,7 @@ from scripts.tools import (
     handoff_from_tool_calls,
 )
 from scripts.display import stream_chat_response
+from scripts.skills import web_search, fetch_url, summarize_text, calculate
 from scripts.role_loader import load_role, roles_providing_tool, role_tool_names
 from scripts.dispatch import invoke_role
 from scripts.memory import (
@@ -109,7 +111,23 @@ MAX_HANDOFF_NUDGES = 1
 # toolを名前だけ借りて呼ぼうとしている（実機で summarize_text を直接
 # 呼ぼうとするのを確認）。以前は黙って捨てていたため、ユーザーには生の
 # JSONだけが表示され、依頼は果たされないまま終わっていた。
-SERVICEABLE_TOOL_NAMES = {"remember", "handoff_to_role"}
+SERVICEABLE_TOOL_NAMES = {
+    "remember", "handoff_to_role",
+    "search_web", "fetch_url", "summarize_text", "calculate",
+}
+
+# 上記のうち「実行して結果を本人に返し、同じターンの中で考えを続けさせる」もの。
+# いずれも副作用が無く承認フローも要らない読み取り専用スキルなので、
+# 雑談役が自分で実行してよい（scripts/skills.py）。
+CHAT_SKILL_ACTION_TYPES = {"search", "fetch_url", "summarize", "calculate"}
+
+# 1ターンの中で連続してスキルを実行できる上限。
+# 検索→本文取得→要約、程度は通したいが、無限に調べ続けさせない。
+MAX_SKILL_STEPS = 5
+
+# skillの結果が長すぎると雑談役のnum_ctxを食い潰すため、ここで頭打ちにする
+# （arc_agent.py側と同じ考え方。特にfetch_urlはページ全文が返る）。
+MAX_SKILL_FEEDBACK = 6000
 
 
 def _called_tool_names(tool_calls):
@@ -122,43 +140,118 @@ def _called_tool_names(tool_calls):
     return names
 
 
-# 「自分ではできない/他の役に引き継ぐ」という【意図】が本文に出ているかを見る
-# パターン。tool呼び出しが1つも無い返答に対してのみ使う（下記
-# _looks_like_unfulfilled_handoff 参照）。
-_HANDOFF_INTENT_PATTERNS = (
-    "引き継",
-    "引継",
-    "役に頼",
-    "役に依頼",
-    "役にお願い",
-    "役を呼",
-    "私は直接",
-    "私には直接",
-    "自分では",
-    "自分には",
-    "検索してみてください",
-    "調べてみてください",
-    "確認してみてください",
-)
-
-
-def _looks_like_unfulfilled_handoff(text: str) -> bool:
+def _run_chat_skill(act, model_name):
     """
-    「他の役に引き継ぐ」「自分では出来ない」と会話文で述べているのに、
-    実際のtool呼び出しが1つも無い返答かどうかを判定する。
+    雑談役が自分で実行してよい読み取り専用スキルを1つ実行し、
+    モデルに返すフィードバック文字列を返す。
 
-    [NOTE] プロンプト側で「必ずtool呼び出し機能そのものを使うこと」と
-    何度強調しても、小型モデルでは確率的にしか守られないことを今夜
-    繰り返し確認している（roles/*/prompt.txt の【絶対ルール】、
-    role_loader._inject_skill_notes のいずれも、単独では取りこぼす）。
-    そのため「言ったのにやっていない」状態をコード側で検知して、
-    1回だけ促し直す保険をかける。これはこのプロジェクトで一貫して
-    採ってきた「プロンプトでの軽減＋コードでの保険」の方針に沿う
+    [NOTE] roles/chat/role.json に、ここで実装していないtoolを足すと
+    「使えないtool」として弾かれてしまう。tool を増やす時は
+    SERVICEABLE_TOOL_NAMES と、必要ならここの分岐も併せて更新すること
+    （起動時に _check_chat_tools_implemented() が食い違いを検出する）。
+    """
+    if act["type"] == "search":
+        print(f"\n[SEARCH REQUESTED] クエリ: {act['query']}")
+        res = web_search(act["query"])
+    elif act["type"] == "fetch_url":
+        print(f"\n[FETCH REQUESTED] URL: {act['url']}")
+        res = fetch_url(act["url"])
+    elif act["type"] == "summarize":
+        print("\n[SUMMARIZE REQUESTED]")
+        res = f"[SUMMARY]\n{summarize_text(act['text'], model_name, act.get('instruction'))}"
+    elif act["type"] == "calculate":
+        print(f"\n[CALCULATE REQUESTED] {act['expression']}")
+        res = calculate(act["expression"])
+    else:
+        return None
+    if len(res) > MAX_SKILL_FEEDBACK:
+        res = res[:MAX_SKILL_FEEDBACK] + "\n...(長いため省略)"
+    return res
+
+
+def _check_chat_tools_implemented():
+    """
+    roles/chat/role.json のtoolが、この会話ループで本当に実行できるか起動時に確かめる。
+    実装が無いtoolを持たせると、モデルがそれを呼んでも「使えないtool」として
+    弾かれ続けるという分かりにくい壊れ方をするため、起動時に気づけるようにする。
+    """
+    declared = {t["function"]["name"] for t in ROLE["tools"]}
+    unimplemented = sorted(declared - SERVICEABLE_TOOL_NAMES)
+    if unimplemented:
+        print(f"[WARN] roles/chat/role.json の {unimplemented} は "
+              f"chat_agent.py が実行方法を実装していません。"
+              f"呼ばれても実行されないため、role.jsonから外すか実装を追加してください。")
+
+
+# 「自分にはできない」と断って何もしない返答を見つけるためのパターン。
+# tool呼び出しが1つも無い返答に対してのみ使う（_looks_like_deflection 参照）。
+#
+# [IMPORTANT] 「リアルタイム情報を提供する能力はありません」系は、モデルが
+# 事前学習で強く持っている定型句で、プロンプトで「あなたは検索できる」と
+# 書いても最初の一回はこれが出てしまうことを実機で確認した。素の
+# 「私は直接」だけでは拾えないため、断り文句・丸投げ文句を広めに列挙する。
+_DEFLECTION_PATTERNS = (
+    # 「自分にはその能力が無い」と明確に断っている
+    "私は直接", "私には直接", "私が直接",
+    "能力はありません", "能力がありません", "能力を持っていません",
+    "対応できません", "できかねます",
+    "検索できません", "調べられません", "調べることはできません",
+    # ユーザー自身に検索させようとしている
+    "検索してみてください", "調べてみてください",
+    "検索してください", "調べてください",
+    "利用するのがおすすめ",
+)
+# [IMPORTANT] ここに何を入れないかが重要。実機で次の誤検知を出した:
+#   ユーザー「何ができる？」
+#   雑談役「…ファイルの読み書きはできません。それらが必要な場合は
+#           適切な役に【引き継ぐ】のでご安心ください」
+# これは完全に正しい自己紹介なのに、「引き継」が引っかかって促しが走り、
+# 促し文に載せた例のクエリ（東京 天気 今日）をモデルが丸写しして、
+# 会話と無関係な検索を実行してしまった。
+# 「引き継/引継/役に頼/自分では」等は、断りではない普通の説明文にも
+# 当たり前に出てくるため、意図的に外してある。
+# 同様に「できません」「ご覧ください」「確認してください」も汎用的すぎるので入れない
+# （「そのバージョンでは指定できません」「詳しくはドキュメントをご覧ください」等）。
+# 検索後にリンクを並べて終わる形は、言い回しではなく
+# _looks_like_link_dump() で構造的に検知する。
+
+
+def _looks_like_deflection(text: str) -> bool:
+    """
+    「自分にはできない」「他の役に引き継ぐ」と会話文で述べるだけで、
+    実際のtool呼び出しを1つもしていない返答かどうかを判定する。
+
+    [NOTE] プロンプト側で「あなたは検索できる」「必ずtool呼び出し機能を
+    使うこと」と何度強調しても、小型モデルでは確率的にしか守られないことを
+    繰り返し確認している。そのため「断っただけで何もしていない」状態を
+    コード側で検知して1回だけ促し直す保険をかける。これはこのプロジェクトで
+    一貫して採ってきた「プロンプトでの軽減＋コードでの保険」の方針に沿う
     （arc_agent.py の MAX_AUTO_STEPS / MAX_FAILURE_STREAK 等と同じ考え方）。
     """
     if not text:
         return False
-    return any(pattern in text for pattern in _HANDOFF_INTENT_PATTERNS)
+    return any(pattern in text for pattern in _DEFLECTION_PATTERNS)
+
+
+_URL_RE = re.compile(r"https?://[^\s)\]>\"'、。]+")
+
+
+def _looks_like_link_dump(text: str, searched: bool, fetched: bool) -> bool:
+    """
+    検索はしたのに本文を読まず、URLを並べただけで終わらせた返答かを判定する。
+
+    [IMPORTANT] 言い回しでの判定はやめて、構造で判定する。
+    実機で「〜サイトを訪れてみてください」を検知できるようにしたら、次は
+    「これらのサイトから最新の天気情報を得ることができます」と言い換えられ、
+    その次は別の言い方…と、いたちごっこになった。日本語の言い換えは無限にあり、
+    パターンを増やすほど普通の説明文まで誤検知する。
+    一方「検索したのに本文は読まず、URLだけ複数並べた」という【形】は
+    言い回しに左右されない。search_webが返すのは一覧に過ぎないので、
+    この形になっている時点で、ユーザーの質問には答えられていない。
+    """
+    if not searched or fetched:
+        return False
+    return len(set(_URL_RE.findall(text or ""))) >= 2
 
 
 def run_role_and_wait(server_proc, role_id, instructions, log_path, root_request=None):
@@ -231,9 +324,13 @@ def run_chat_loop(model_name, server_proc, log_path):
             messages.append({"role": "user", "content": user_input})
             append_session_log(log_path, "User", user_input)
 
-            # [NOTE] 「引き継ぐと言ったのにtool呼び出しが無い」場合に1回だけ
-            # 促し直すため、モデル呼び出しをループにしてある（通常は1周で抜ける）。
+            # [NOTE] このループは1周で抜けるのが普通。周回するのは
+            # (a) 読み取り専用スキルを実行して結果を本人に返す時、
+            # (b) 「引き継ぐと言ったのにtool呼び出しが無い」等を促し直す時。
             nudges_used = 0
+            skill_steps = 0
+            remembered = False
+            fetched = False   # このターンで fetch_url を実行したか（リンク丸投げ検知に使う）
             while True:
                 payload = json.dumps({
                     "model": model_name,
@@ -268,6 +365,62 @@ def run_chat_loop(model_name, server_proc, log_path):
                 append_session_log(log_path, "Assistant", strip_think_blocks(content) or "(tool呼び出しのみ)")
 
                 effective_tool_calls = tool_calls or tool_call_from_content(content)
+                actions = tool_calls_to_actions(effective_tool_calls)
+
+                # [IMPORTANT] rememberは他のtool呼び出しと束ねて出てくることがある。
+                # 終端系(handoff)を先に見ると取りこぼすため、常にここで先に処理する。
+                for act in actions:
+                    if act["type"] == "remember":
+                        append_shared_memory(BASE_DIR, "chat", act["note"])
+                        print(f"\n[REMEMBER] 共有メモに書き残しました: {act['note']}")
+                        append_session_log(log_path, "System", f"共有メモに追記: {act['note']}")
+                        remembered = True
+
+                # --- 読み取り専用スキルは雑談役が自分で実行する ---
+                # [NOTE] 以前は雑談役にこれらのtoolを持たせず、「調べて」の
+                # たびに他の役へ引き継いでいた。しかし引き継ぎは
+                # 「自分のモデルをアンロード→相手をロード→戻ってきて自分を再ロード」
+                # という重い往復で、実機では数分かかるうえ、最も壊れやすい経路
+                # でもあった（能力の誤申告の伝染・たらい回し）。search_web等は
+                # 副作用が無く承認も要らないので、雑談役が直接使ってよい。
+                skill_acts = [a for a in actions if a["type"] in CHAT_SKILL_ACTION_TYPES]
+                if skill_acts:
+                    if skill_steps >= MAX_SKILL_STEPS:
+                        print(f"\n[SYSTEM] 1ターンでのスキル実行が上限({MAX_SKILL_STEPS}回)に達しました。")
+                        messages.append({"role": "user", "content": (
+                            "[SYSTEM NOTICE] 1回のやり取りで調べられる回数の上限に"
+                            "達しました。これ以上toolを呼ばず、ここまでに分かったことを"
+                            "普通の会話文でユーザーに答えてください。"
+                        )})
+                        skill_steps = 0
+                        continue
+                    if any(a["type"] == "fetch_url" for a in skill_acts):
+                        fetched = True
+                    feedback = "\n\n".join(
+                        r for r in (_run_chat_skill(a, model_name) for a in skill_acts) if r
+                    )
+                    # [IMPORTANT] 検索結果を返すだけだと、モデルは
+                    # 「参考になるサイトはこちらです」とサイト名やURLを列挙して
+                    # 終わりにしがちで、ユーザーの質問には答えないままになる。
+                    # 悪い出力を後から検知して直させるより、結果を渡す【その場で】
+                    # 次に何をすべきかを添える方が確実（実機で、検知側の言い回し
+                    # 一致は何度もすり抜けられた）。
+                    if any(a["type"] == "search" for a in skill_acts) and not fetched:
+                        feedback += (
+                            "\n\n[SYSTEM NOTICE] 上は検索結果の一覧です。"
+                            "タイトル・URL・短い抜粋だけで、ユーザーが知りたい中身"
+                            "そのものではありません。"
+                            "サイト名やURLを並べただけの返答は、質問への回答に"
+                            "なっていません（ユーザーに調べさせているのと同じです）。"
+                            "抜粋だけで確実に答えられる場合を除き、この中から最も"
+                            "適したURLを1つ選んで fetch_url を実行し、本文を読んでから"
+                            "答えてください。"
+                        )
+                    print("\n[SYSTEM] 実行結果をAIにフィードバックして解析中...")
+                    append_session_log(log_path, "System", f"スキル実行結果を反映({len(skill_acts)}件)")
+                    messages.append({"role": "user", "content": feedback})
+                    skill_steps += 1
+                    continue
 
                 # --- 物理防御: 依頼が無言で取りこぼされる2種類のパターンを検知し、
                 # 1回だけ促して作り直させる ---
@@ -303,39 +456,77 @@ def run_chat_loop(model_name, server_proc, log_path):
                     append_session_log(
                         log_path, "System",
                         f"使用不可のtool呼び出しを検知({', '.join(unavailable)})のため促し直し")
-                elif _looks_like_unfulfilled_handoff(strip_think_blocks(content)):
-                    # パターン2: 「引き継ぎます」と会話文で述べたのにtool呼び出しが無い。
+                elif _looks_like_link_dump(strip_think_blocks(content), skill_steps > 0, fetched):
+                    # パターン2: 検索はしたが本文を読まず、URLを並べて終わらせた。
+                    # search_webは一覧を返すだけなので、この形では質問に答えられていない。
                     nudge = (
-                        "[SYSTEM NOTICE] あなたは今の返答で「他の役に引き継ぐ」または"
-                        "「自分では対応できない」と述べましたが、実際のtool呼び出しが"
-                        "1つも行われていません。会話文でそう書くだけでは何も実行されず、"
-                        "ユーザーの依頼は果たされないままです。"
-                        "ユーザーに手順を尋ね返したり、ユーザー自身にやらせる案内をしたり"
-                        "せず、今すぐtool呼び出し機能そのものを使って handoff_to_role を"
-                        "呼び出してください（引き継ぎ先・具体的な作業指示・理由を引数に"
-                        "入れること）。"
+                        "[SYSTEM NOTICE] 今の返答は誤りです。検索は済んでいますが、"
+                        "search_webが返すのは検索結果の一覧（タイトル・URL・短い抜粋）"
+                        "だけで、ユーザーが知りたい中身そのものではありません。"
+                        "リンクを並べて案内するのは、結局ユーザー自身に調べさせているのと"
+                        "同じで誤りです。\n"
+                        "検索結果の中から最も適したURLを1つ選び、今すぐ"
+                        "tool呼び出し機能で fetch_url を実行して本文を取得し、"
+                        "その内容を読んでユーザーの質問に直接答えてください:\n"
+                        "```json\n"
+                        '{"name": "fetch_url", "arguments": {"url": "https://..."}}\n'
+                        "```\n"
+                        "※ urlには、直前の検索結果に実際に出てきたURLを入れること"
+                        "（存在しないURLを想像で書かないこと）。"
                     )
-                    print("\n[SYSTEM] 引き継ぐと述べましたが実際のtool呼び出しがありません。促し直します。")
-                    append_session_log(log_path, "System", "引き継ぎ意図はあるがtool呼び出しが無いため促し直し")
+                    print("\n[SYSTEM] 検索結果のリンクを並べただけの返答を検知しました。促し直します。")
+                    append_session_log(log_path, "System", "検索後にfetch_urlせず丸投げしたため促し直し")
+                elif _looks_like_deflection(strip_think_blocks(content)):
+                    # パターン3: 「自分にはできない」と断っただけでtool呼び出しが無い。
+                    # [IMPORTANT] ここで handoff_to_role を勧めてはいけない。
+                    # 一般的な調べ物は雑談役自身のスキルで完結するのに、
+                    # 引き継ぎを勧めるとモデルは素直に従い、不要なモデル入れ替えが
+                    # 走る（実機で、天気を聞かれてexecute役に引き継ぐのを確認）。
+                    # まず「自分でやれ」、権限が要る時だけ引き継ぎ、の順で促す。
+                    # [IMPORTANT] 抽象的に「search_webを使え」と促すだけでは
+                    # 効かないことを実機で確認した（促した直後に「私の誤解が
+                    # ありました」と言いながら、同じ断り文句を繰り返した）。
+                    # このプロジェクトで一貫して効いてきたのは、そのまま真似できる
+                    # 具体的なJSONを見せること（plan役の未呼び出し問題等でも同様）。
+                    # [NOTE] ただし query に依頼文をそのまま埋めた例を見せるのは
+                    # 逆効果だった。モデルはその文字列を丸写しし、
+                    # 「貴方が調べてよ」のような検索語として無意味なqueryで
+                    # 検索してしまう（実機で確認）。呼び出しの【形】だけを見せ、
+                    # 中身は会話から自分で組み立てさせる。
+                    nudge = (
+                        "[SYSTEM NOTICE] 今の返答は誤りです。あなたは search_web を"
+                        "持っており、ネット検索をその場で実行できます。"
+                        "「リアルタイム情報を提供する能力はありません」は、"
+                        "search_webを持っていなかった頃の言い回しで、"
+                        "今のあなたには当てはまりません。\n"
+                        "会話文で断るだけでは何も実行されず、ユーザーの依頼は"
+                        "果たされないままです。ユーザーは検索の仕方を聞いているのでは"
+                        "なく、あなたに調べてほしいと言っています。\n"
+                        "今すぐ、次の形のtool呼び出しを（文章としてではなく"
+                        "tool呼び出し機能そのもので）実行してください:\n"
+                        "```json\n"
+                        '{"name": "search_web", "arguments": {"query": "検索キーワード"}}\n'
+                        "```\n"
+                        "※ \"検索キーワード\" の部分は、この例の文字列をそのまま使わず、"
+                        "直前までの会話でユーザーが知りたがっている内容に合う検索語を"
+                        "自分で組み立てて入れること（ユーザーの発言をそのまま貼るのでは"
+                        "なく、検索に適した語にする。例えば「貴方が調べてよ」ではなく"
+                        "「東京 天気 今日」のように）。\n"
+                        "検索結果が返ってきたら、それを読んでユーザーに答えること。\n"
+                        "なお、ファイルの読み書きやコマンド実行など、あなたの権限では"
+                        "できない作業が必要な場合に限り handoff_to_role を使います。"
+                    )
+                    print("\n[SYSTEM] 何もせず断る返答を検知しました。促し直します。")
+                    append_session_log(log_path, "System", "断りだけでtool呼び出しが無いため促し直し")
                 else:
                     break
 
                 nudges_used += 1
                 messages.append({"role": "user", "content": nudge})
 
-            # [IMPORTANT] handoff_to_roleをremember等より先にチェックしていると、
-            # 1回の返答でhandoff_to_role + rememberがまとめて出た時、handoffだけが
-            # 処理されてrememberが無言で捨てられる（arc_agent.py側で実機確認した
-            # のと同じ系統の不具合）。remember等の処理を先に行い、handoffは最後に
-            # チェックする。
-            remembered = False
-            for act in tool_calls_to_actions(effective_tool_calls):
-                if act["type"] == "remember":
-                    append_shared_memory(BASE_DIR, "chat", act["note"])
-                    print(f"\n[REMEMBER] 共有メモに書き残しました: {act['note']}")
-                    append_session_log(log_path, "System", f"共有メモに追記: {act['note']}")
-                    remembered = True
-
+            # [NOTE] remember と読み取り専用スキルは上のループの中で処理済み
+            # （handoff等の終端系より先に処理しないと、束ねて出てきた時に
+            # 取りこぼす。arc_agent.py側で実機確認した不具合と同じ系統）。
             handoff = handoff_from_tool_calls(effective_tool_calls)
             if handoff and handoff["role_id"] not in ROLE.get("can_handoff_to", []):
                 # [IMPORTANT] tool定義のenumで制限していても、モデルはそれを無視した
@@ -397,6 +588,7 @@ def run_chat_loop(model_name, server_proc, log_path):
 
 
 def main():
+    _check_chat_tools_implemented()
     setup_environment()
     startup_cleanup()
 
