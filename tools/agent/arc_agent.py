@@ -557,6 +557,8 @@ def start_interactive_chat(model_name: str, exec_mode: str, server_proc,
     # 12回リトライし続けた不具合を確認した。型が同じでも結果が失敗し続けて
     # いれば、進捗が無いという意味では同一アクション連続と同じ暴走。
     MAX_FAILURE_STREAK = 2
+    # 失敗が続いた時、いきなり止めずに「引き継ぐ/別手段/報告」を促す回数。
+    MAX_FAILURE_NUDGES = 1
 
     # [IMPORTANT] 想定外の例外（バグ・EOFError等）でここから抜けた場合でも、
     # VRAM解放だけは必ず行う。既知の終了経路はそれぞれ自分でteardown()を
@@ -601,6 +603,7 @@ def start_interactive_chat(model_name: str, exec_mode: str, server_proc,
             same_action_count = 0
             remember_streak = 0
             failure_streak = 0
+            failure_nudges = 0
 
             while True:
                 payload = json.dumps({
@@ -882,6 +885,33 @@ def start_interactive_chat(model_name: str, exec_mode: str, server_proc,
                     failure_streak = 0
 
                 if failure_streak >= MAX_FAILURE_STREAK:
+                    # [IMPORTANT] 失敗が続いた時こそ「他の役に頼る」場面。
+                    # 以前はここで即・強制停止していたが、それでは
+                    # 「自分で手詰まりになったら頼る」という設計上の引き継ぎ理由
+                    # （role_loader._inject_skill_notes の判断基準2）が
+                    # 実際には一度も発動しないまま終わってしまう。
+                    # まず1回だけ、引き継ぎ or 別手段 or 報告を促して続行させ、
+                    # それでも失敗が続くようなら従来どおり強制停止する。
+                    failure_streak = 0
+                    if failure_nudges < MAX_FAILURE_NUDGES and not at_max_depth:
+                        failure_nudges += 1
+                        print(f"\n[SYSTEM] 失敗が{MAX_FAILURE_STREAK}回続きました。"
+                              f"引き継ぎ含め、別の手を促します。")
+                        messages.append({
+                            "role": "user",
+                            "content": "[SYSTEM NOTICE] 同じ種類の操作が連続して失敗しています。"
+                                       "存在しないパスやコマンドを推測で試し続けても解決しません。"
+                                       "ここで次のいずれかを選んでください: "
+                                       "(1) はっきり別の方法に切り替える、"
+                                       "(2) この作業に向いた別の役に handoff_to_role で引き継ぐ"
+                                       "（自分で手詰まりになった時こそ引き継ぐ場面です）、"
+                                       "(3) これ以上できることが無ければ return_to_caller で"
+                                       "何を試して何が失敗したかを具体的に報告する。"
+                        })
+                        append_session_log(log_path, "System", "失敗連続のため引き継ぎ/別手段/報告を促した")
+                        auto_steps += 1
+                        if auto_steps < MAX_AUTO_STEPS:
+                            continue
                     print(f"\n[SYSTEM] 物理防御作動: 同じ種類の操作が{MAX_FAILURE_STREAK}回連続で失敗。強制停止します。")
                     messages.append({
                         "role": "user",
