@@ -125,6 +125,10 @@ CHAT_SKILL_ACTION_TYPES = {"search", "fetch_url", "summarize", "calculate"}
 # 検索→本文取得→要約、程度は通したいが、無限に調べ続けさせない。
 MAX_SKILL_STEPS = 5
 
+# 同じスキルを同じ引数で呼び直すだけの周回が、これだけ続いたら打ち切って
+# 「今ある情報で答えろ」と促す（進んでいないのにターンが伸びるのを防ぐ）。
+MAX_REPEATED_SKILL_ROUNDS = 2
+
 # skillの結果が長すぎると雑談役のnum_ctxを食い潰すため、ここで頭打ちにする
 # （arc_agent.py側と同じ考え方。特にfetch_urlはページ全文が返る）。
 MAX_SKILL_FEEDBACK = 6000
@@ -167,6 +171,27 @@ def _run_chat_skill(act, model_name):
     if len(res) > MAX_SKILL_FEEDBACK:
         res = res[:MAX_SKILL_FEEDBACK] + "\n...(長いため省略)"
     return res
+
+
+def _skill_cache_key(act):
+    """
+    スキル呼び出しを「同じ呼び出しかどうか」で識別するキーを作る。
+
+    [NOTE] 実機で、同じターンの中で calculate を同じ式のまま5回、
+    search を同じクエリで3回呼ぶ挙動を確認した（MAX_SKILL_STEPSで
+    止まるので暴走はしないが、結果は毎回同じなので純粋に無駄）。
+    引数まで含めて突き合わせ、2回目以降は実行せず前回の結果を返す。
+    """
+    t = act["type"]
+    if t == "search":
+        return (t, act.get("query", "").strip())
+    if t == "fetch_url":
+        return (t, act.get("url", "").strip())
+    if t == "calculate":
+        return (t, act.get("expression", "").strip())
+    if t == "summarize":
+        return (t, hash(act.get("text", "")), (act.get("instruction") or "").strip())
+    return (t,)
 
 
 def _check_chat_tools_implemented():
@@ -331,6 +356,8 @@ def run_chat_loop(model_name, server_proc, log_path):
             skill_steps = 0
             remembered = False
             fetched = False   # このターンで fetch_url を実行したか（リンク丸投げ検知に使う）
+            skill_cache = {}      # このターンで実行済みのスキル呼び出し → 結果
+            repeated_rounds = 0   # 実行済みの呼び出しだけを繰り返した回数
             while True:
                 payload = json.dumps({
                     "model": model_name,
@@ -396,9 +423,40 @@ def run_chat_loop(model_name, server_proc, log_path):
                         continue
                     if any(a["type"] == "fetch_url" for a in skill_acts):
                         fetched = True
-                    feedback = "\n\n".join(
-                        r for r in (_run_chat_skill(a, model_name) for a in skill_acts) if r
-                    )
+
+                    # 同じターン内で同じ呼び出しを繰り返しても結果は変わらないので、
+                    # 2回目以降は実行せず前回の結果を返し、そう伝える。
+                    feedback_parts = []
+                    all_cached = True
+                    for a in skill_acts:
+                        key = _skill_cache_key(a)
+                        if key in skill_cache:
+                            feedback_parts.append(
+                                f"[SYSTEM NOTICE] その {a['type']} は、このやり取りの中で"
+                                "既に同じ引数で実行済みです。呼び直しても結果は変わりません。"
+                                "以下は前回の結果なので、これを使って答えてください。\n"
+                                + skill_cache[key]
+                            )
+                            print(f"\n[SYSTEM] 実行済みの {a['type']} を再要求されました。前回の結果を返します。")
+                            continue
+                        res = _run_chat_skill(a, model_name)
+                        if res is None:
+                            continue
+                        skill_cache[key] = res
+                        all_cached = False
+                        feedback_parts.append(res)
+
+                    if all_cached:
+                        # 前に進んでいない。何度も続くようなら打ち切って答えさせる。
+                        repeated_rounds += 1
+                        if repeated_rounds >= MAX_REPEATED_SKILL_ROUNDS:
+                            print("\n[SYSTEM] 同じスキル呼び出しの繰り返しを検知しました。回答を促します。")
+                            append_session_log(log_path, "System", "同一スキル呼び出しの繰り返しを検知")
+                            skill_steps = MAX_SKILL_STEPS
+                    else:
+                        repeated_rounds = 0
+
+                    feedback = "\n\n".join(feedback_parts)
                     # [IMPORTANT] 検索結果を返すだけだと、モデルは
                     # 「参考になるサイトはこちらです」とサイト名やURLを列挙して
                     # 終わりにしがちで、ユーザーの質問には答えないままになる。
