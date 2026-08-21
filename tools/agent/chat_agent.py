@@ -41,6 +41,7 @@ from scripts.ollama import (
 )
 from scripts.tools import (
     strip_think_blocks,
+    strip_tool_call_json,
     tool_call_from_content,
     tool_calls_to_actions,
     handoff_from_tool_calls,
@@ -87,7 +88,16 @@ CHAT_MODEL = ROLE["model"]
 # 会話が始まる前から黙って切り詰められていた可能性がある（エラーにならない
 # ため気づきにくい）。arc_agent.py側は元からnum_ctxを明示していたが、
 # chat_agent.py側は抜けていたため揃える。
-CHAT_NUM_CTX = 8192
+# [IMPORTANT] 8192では足りない。実測で、システムプロンプト(7,546字) +
+# tool定義JSON(2,602字) = 10,148字が、会話が始まる前に消費されている
+# （日本語は概ね1字≒1トークン以上）。役やスキルが増えるたびに自動注入
+# （専門性・呼び出し履歴・スキルの使いどころ）が積み上がって膨らんだ結果で、
+# 8192のままだと1ターン目でぎりぎり、2ターン目には確実に溢れて、
+# 取得したページ本文が黙って切り捨てられる。
+# 実機では「1ターン目は同じURLの内容から天気を答えられるのに、2ターン目は
+# 同じ内容を読み取れないと言う」という形で現れた。
+# qwen2.5系は32kまで扱えるので、まず倍にして余裕を持たせる。
+CHAT_NUM_CTX = 16384
 
 # [IMPORTANT] 以前はここが 0.6 だった（雑談の自然さを狙って高めにしていた）。
 # しかし実機テストで、雑談役だけが「Review役に引き継ぐことができます。手順を
@@ -128,6 +138,10 @@ MAX_SKILL_STEPS = 5
 # 同じスキルを同じ引数で呼び直すだけの周回が、これだけ続いたら打ち切って
 # 「今ある情報で答えろ」と促す（進んでいないのにターンが伸びるのを防ぐ）。
 MAX_REPEATED_SKILL_ROUNDS = 2
+
+# rememberだけ呼んでユーザーに答えないまま終わろうとした時に、
+# 「答えて」と促す回数の上限。
+MAX_ANSWER_PROMPTS = 2
 
 # skillの結果が長すぎると雑談役のnum_ctxを食い潰すため、ここで頭打ちにする
 # （arc_agent.py側と同じ考え方。特にfetch_urlはページ全文が返る）。
@@ -171,6 +185,26 @@ def _run_chat_skill(act, model_name):
     if len(res) > MAX_SKILL_FEEDBACK:
         res = res[:MAX_SKILL_FEEDBACK] + "\n...(長いため省略)"
     return res
+
+
+def _restate_question(user_input):
+    """
+    催促の末尾に、ユーザーの元の質問を再掲する一文を作る。
+
+    [IMPORTANT] コード側の催促は user ロールのメッセージとして差し込まれる。
+    モデルから見ると「最新のユーザー発言＝こちらの指示文」になるため、
+    そのまま書くと【指示文に対する返事】を書いてしまう。実機では
+    「了解しました。ユーザーの質問に直接答えていきます。例えば…以下のように
+    返答します：」という、回答ではなく回答例を提示するだけの応答になった。
+    末尾で元の質問を再掲し、モデルの自然な続きが「その質問への回答」に
+    なるようにする。
+    """
+    q = (user_input or "").strip()
+    if not q:
+        return ""
+    return ("----\n"
+            "ユーザーの質問（この質問そのものに、直接答えること）:\n"
+            f"{q}")
 
 
 def _tried_summary(skill_cache):
@@ -270,6 +304,27 @@ def _looks_like_deflection(text: str) -> bool:
     return any(pattern in text for pattern in _DEFLECTION_PATTERNS)
 
 
+def _mentions_tool_without_calling(text: str) -> bool:
+    """
+    文中で自分のtool名に言及しているのに、tool呼び出しを1つもしていないかを判定する。
+
+    [IMPORTANT] 言い回しではなく【形】で捕まえるための判定。実機で
+    「search_webで札幌市の最新天気情報を調べてみましょう。」と言うだけで
+    実際には呼び出さずターンを終える例を確認したが、これは拒否表現では
+    ないため、断り文句のパターン一致では拾えなかった。
+    日本語の言い方は無限にある一方、「自分のtool名を書いている」という
+    事実は表現に依存しない。実行する気があったのに実行していない、という
+    状態をこれで拾う。
+
+    [NOTE] 「何ができる？」への説明でtool名を挙げた場合も引っかかりうるが、
+    その時の促し文は「実行する意図があるなら呼び出し、説明していただけなら
+    そのまま答えてよい」と書いてあるので害は無い（予算も1回だけ）。
+    """
+    if not text:
+        return False
+    return any(name in text for name in SERVICEABLE_TOOL_NAMES)
+
+
 _URL_RE = re.compile(r"https?://[^\s)\]>\"'、。]+")
 
 
@@ -364,12 +419,21 @@ def run_chat_loop(model_name, server_proc, log_path):
             # [NOTE] このループは1周で抜けるのが普通。周回するのは
             # (a) 読み取り専用スキルを実行して結果を本人に返す時、
             # (b) 「引き継ぐと言ったのにtool呼び出しが無い」等を促し直す時。
-            nudges_used = 0
+            # [IMPORTANT] 催促の予算は【種類ごと】に持つ。1つの共通カウンタに
+            # していた時、ターン冒頭の『何もせず断る』で1回使い切ってしまい、
+            # その後ちゃんと検索・取得した【あとで】また断った時には、もう
+            # 促せずにターンが終わっていた（実機で確認）。状況が違えば
+            # 別の催促が要るので、種類別に数える。
+            nudge_counts = {}
+            # このターン限りの「足場」（スキル結果・催促文）を入れた位置。
+            # ターンが終わったら履歴から畳んで、次のターンの文脈を圧迫しない。
+            scaffold_idx = []
             skill_steps = 0
             remembered = False
             fetched = False   # このターンで fetch_url を実行したか（リンク丸投げ検知に使う）
             skill_cache = {}      # このターンで実行済みのスキル呼び出し → 結果
             repeated_rounds = 0   # 実行済みの呼び出しだけを繰り返した回数
+            answer_prompts = 0    # 「メモではなく回答を返せ」と促した回数
             while True:
                 payload = json.dumps({
                     "model": model_name,
@@ -504,6 +568,7 @@ def run_chat_loop(model_name, server_proc, log_path):
                         )
                     print("\n[SYSTEM] 実行結果をAIにフィードバックして解析中...")
                     append_session_log(log_path, "System", f"スキル実行結果を反映({len(skill_acts)}件)")
+                    scaffold_idx.append(len(messages))
                     messages.append({"role": "user", "content": feedback})
                     skill_steps += 1
                     continue
@@ -513,13 +578,41 @@ def run_chat_loop(model_name, server_proc, log_path):
                 called_names = _called_tool_names(effective_tool_calls)
                 unavailable = [n for n in called_names if n not in SERVICEABLE_TOOL_NAMES]
 
+                # [IMPORTANT] rememberは「メモを残すだけ」の非終端tool。
+                # これを呼んだだけでターンを終えると、ユーザーには
+                # 「[REMEMBER] …」と表示されるだけで質問への答えが返らない
+                # （実機で、天気を調べ切ったあとrememberを呼んで終わり、
+                # ユーザーが答えを受け取れない状態を確認）。
+                # tool呼び出しを除いて人に向けた文章が何も残っていなければ、
+                # まだ答えていないので、答えるまで続けさせる。
+                if (remembered and not handoff_from_tool_calls(effective_tool_calls)
+                        and not strip_tool_call_json(strip_think_blocks(content), describe=False).strip()
+                        and answer_prompts < MAX_ANSWER_PROMPTS):
+                    answer_prompts += 1
+                    print("\n[SYSTEM] メモを書いただけで回答がありません。回答を促します。")
+                    append_session_log(log_path, "System", "rememberのみで未回答のため回答を促した")
+                    messages.append({"role": "user", "content": (
+                        "[SYSTEM NOTICE] 共有メモへの書き込みは完了しました。"
+                        "ただし、ユーザーの質問にはまだ答えていません。"
+                        "rememberはメモを残すだけのtoolで、呼んでもユーザーの画面には"
+                        "答えが表示されません。"
+                        "ここまでに調べた内容を使って、ユーザーの質問に"
+                        "普通の会話文で答えてください（toolは呼ばなくてよい）。\n"
+                        "[IMPORTANT] 次の返答は、ユーザーに直接向けた【回答そのもの】に"
+                        "すること。「〜のように回答できます」「以下のように答えます」の"
+                        "ような説明や例示ではなく、回答の本文だけを書くこと"
+                        "（実機で、回答例を提示するだけで終わる誤りを確認している）。\n"
+                        + _restate_question(user_input)
+                    )})
+                    continue
+
                 # 何か1つでもこのループで処理できるtoolがあれば、通常処理へ進む。
                 if any(n in SERVICEABLE_TOOL_NAMES for n in called_names):
                     break
-                if nudges_used >= MAX_HANDOFF_NUDGES:
-                    break
-
+                nudge_kind = None
+                nudge_notice = nudge_log = ""
                 if unavailable:
+                    nudge_kind = "unavailable"
                     # パターン1: 自分が持っていないtoolを名前だけ借りて直接呼んだ。
                     owners = []
                     for name in unavailable:
@@ -538,11 +631,10 @@ def run_chat_loop(model_name, server_proc, log_path):
                         "handoff_to_role で引き継ぐか、会話だけで答えられる内容なら"
                         "tool を使わず普通の会話文で答えてください。"
                     )
-                    print(f"\n[SYSTEM] 使えないtool({', '.join(unavailable)})を呼ぼうとしました。促し直します。")
-                    append_session_log(
-                        log_path, "System",
-                        f"使用不可のtool呼び出しを検知({', '.join(unavailable)})のため促し直し")
+                    nudge_notice = f"使えないtool({', '.join(unavailable)})を呼ぼうとしました"
+                    nudge_log = f"使用不可のtool呼び出しを検知({', '.join(unavailable)})のため促し直し"
                 elif _looks_like_link_dump(strip_think_blocks(content), skill_steps > 0, fetched):
+                    nudge_kind = "link_dump"
                     # パターン2: 検索はしたが本文を読まず、URLを並べて終わらせた。
                     # search_webは一覧を返すだけなので、この形では質問に答えられていない。
                     nudge = (
@@ -558,11 +650,47 @@ def run_chat_loop(model_name, server_proc, log_path):
                         '{"name": "fetch_url", "arguments": {"url": "https://..."}}\n'
                         "```\n"
                         "※ urlには、直前の検索結果に実際に出てきたURLを入れること"
-                        "（存在しないURLを想像で書かないこと）。"
+                        "（存在しないURLを想像で書かないこと）。\n"
+                        + _restate_question(user_input)
                     )
-                    print("\n[SYSTEM] 検索結果のリンクを並べただけの返答を検知しました。促し直します。")
-                    append_session_log(log_path, "System", "検索後にfetch_urlせず丸投げしたため促し直し")
+                    nudge_notice = "検索結果のリンクを並べただけの返答を検知しました"
+                    nudge_log = "検索後にfetch_urlせず丸投げしたため促し直し"
                 elif _looks_like_deflection(strip_think_blocks(content)):
+                    nudge_kind = "deflection"
+                    if skill_cache:
+                        # [IMPORTANT] 既に調べ終わっているのに断った場合に
+                        # 「search_webを実行しろ」と促すのは的外れ（実機で、
+                        # 検索も本文取得も済ませた直後に定型の断り文句を出す
+                        # のを確認）。手元にある材料で答えさせる。
+                        nudge = (
+                            "[SYSTEM NOTICE] 今の返答は誤りです。あなたはこのやり取りの中で"
+                            "既に調べ物を実行しており、その結果は上のやり取りに残っています。\n"
+                            f"既に試したこと:\n{_tried_summary(skill_cache)}\n"
+                            "「リアルタイム情報を提供する能力はありません」は、"
+                            "調べる手段が無かった頃の言い回しで、今のあなたには"
+                            "当てはまりません。取得済みの内容を読み返して、"
+                            "ユーザーの質問に普通の会話文で直接答えてください。\n"
+                            "取得した内容に答えが無かった場合は、(a) 別のURLをfetch_urlする、"
+                            "(b) 違うキーワードで検索し直す、(c) 分かった範囲と分からなかった点を"
+                            "正直に伝える、のいずれかにすること。"
+                            "ユーザーに「ご自身でご確認ください」と案内して終わるのは禁止です。\n"
+                            + _restate_question(user_input)
+                        )
+                        # [IMPORTANT] 「調査前に断った」のと「調べ終わったのに断った」のは
+                        # 別の状況なので、催促の予算も分ける。同じ"deflection"で数えると、
+                        # ターン冒頭の断りで使い切ってしまい、肝心の
+                        # 「材料が揃っているのに断る」場面で促せなかった（実機で確認）。
+                        nudge_kind = "deflection_after_research"
+                        # [IMPORTANT] printは予算チェックの後で行う。先に出すと、
+                        # 実際には促していないのに「促し直します」と表示され、
+                        # ログを読んだ人（と私）が誤解する（実機で出した）。
+                        if nudge_counts.get(nudge_kind, 0) >= MAX_HANDOFF_NUDGES:
+                            break
+                        nudge_counts[nudge_kind] = nudge_counts.get(nudge_kind, 0) + 1
+                        print("\n[SYSTEM] 調べ終わっているのに断る返答を検知しました。促し直します。")
+                        append_session_log(log_path, "System", "調査済みだが断ったため促し直し")
+                        messages.append({"role": "user", "content": nudge})
+                        continue
                     # パターン3: 「自分にはできない」と断っただけでtool呼び出しが無い。
                     # [IMPORTANT] ここで handoff_to_role を勧めてはいけない。
                     # 一般的な調べ物は雑談役自身のスキルで完結するのに、
@@ -602,13 +730,49 @@ def run_chat_loop(model_name, server_proc, log_path):
                         "なお、ファイルの読み書きやコマンド実行など、あなたの権限では"
                         "できない作業が必要な場合に限り handoff_to_role を使います。"
                     )
-                    print("\n[SYSTEM] 何もせず断る返答を検知しました。促し直します。")
-                    append_session_log(log_path, "System", "断りだけでtool呼び出しが無いため促し直し")
-                else:
-                    break
+                    nudge_notice = "何もせず断る返答を検知しました"
+                    nudge_log = "断りだけでtool呼び出しが無いため促し直し"
+                elif _mentions_tool_without_calling(strip_think_blocks(content)):
+                    # パターン4: 「search_webで調べてみましょう」のように、
+                    # toolを使うと言いながら実際には呼び出していない。
+                    nudge_kind = "said_but_not_done"
+                    nudge = (
+                        "[SYSTEM NOTICE] 返答の中でtoolの名前に言及していますが、"
+                        "実際のtool呼び出しは1つも行われていません。"
+                        "文章の中に名前を書くだけでは何も実行されません。\n"
+                        "[IMPORTANT] 調べていないことを、調べたかのように書かないこと。"
+                        "気温・日付・価格などの具体的な値を、実際にtoolで取得せずに"
+                        "書くのは禁止です（実機で、検索せずに別の都市の気温を"
+                        "作り出してしまった例があります）。\n"
+                        "実行するつもりだったのなら、今すぐtool呼び出し機能そのものを"
+                        "使って実行してください（説明や宣言ではなく、呼び出しを行うこと）。\n"
+                        "toolの説明をしていただけで実行の必要が無いなら、その旨だけを"
+                        "答えてください（調べていない事実を書き足さないこと）。\n"
+                        + _restate_question(user_input)
+                    )
+                    nudge_notice = "toolを使うと言いながら呼び出していない返答を検知しました"
+                    nudge_log = "tool名に言及したが呼び出しが無いため促し直し"
 
-                nudges_used += 1
+                # [IMPORTANT] 表示とログは、実際に促すと決まってから出す。
+                # 分岐の中で先に表示していた時は、予算切れでbreakしても
+                # 「促し直します」とだけ出て、実際には何もしていなかった。
+                if nudge_kind is None or nudge_counts.get(nudge_kind, 0) >= MAX_HANDOFF_NUDGES:
+                    break
+                nudge_counts[nudge_kind] = nudge_counts.get(nudge_kind, 0) + 1
+                print(f"\n[SYSTEM] {nudge_notice}。促し直します。")
+                append_session_log(log_path, "System", nudge_log)
+                scaffold_idx.append(len(messages))
                 messages.append({"role": "user", "content": nudge})
+
+            # [IMPORTANT] 調べ物の結果とコード側の催促文は、そのターンの中でだけ
+            # 必要な作業データ。会話履歴に残すと num_ctx(8192) をすぐ食い潰し、
+            # 次のターンでは肝心のページ本文が押し出されて読めなくなる
+            # （実機で、1ターン目は同じURLの内容から天気を答えられたのに、
+            # 2ターン目は同じ内容を「読み取れません」と言う状態を確認した）。
+            # 結論はこのあとのassistantの回答に残るので、足場は畳んでよい。
+            for i in reversed(scaffold_idx):
+                if 0 <= i < len(messages):
+                    del messages[i]
 
             # [NOTE] remember と読み取り専用スキルは上のループの中で処理済み
             # （handoff等の終端系より先に処理しないと、束ねて出てきた時に

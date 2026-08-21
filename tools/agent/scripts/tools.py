@@ -392,7 +392,7 @@ def strip_think_blocks(text: str) -> str:
     return cleaned.strip()
 
 
-def strip_tool_call_json(text: str) -> str:
+def strip_tool_call_json(text: str, describe: bool = True) -> str:
     """
     会話の抜粋から、tool呼び出しのJSONそのものを取り除き、短い説明に置き換える。
 
@@ -411,6 +411,12 @@ def strip_tool_call_json(text: str) -> str:
         return text
 
     def _describe(obj):
+        # describe=False の時は完全に取り除く。「tool呼び出しを除いたら、
+        # 人に向けた文章が何か残るか」を調べたい場合に使う
+        # （chat_agent.py が「rememberを呼んだだけで、ユーザーには何も
+        # 答えていない」返答を検知するのに使っている）。
+        if not describe:
+            return ""
         name = obj.get("name")
         return f"（{name} のtool呼び出しを実行）" if name else None
 
@@ -430,7 +436,13 @@ def strip_tool_call_json(text: str) -> str:
         obj = _try_parse(match.group(1).strip())
         if obj is None:
             return match.group(0)
-        return _describe(obj) or match.group(0)
+        desc = _describe(obj)
+        # [NOTE] `desc or match.group(0)` と書くと、describe=Falseで空文字を
+        # 返した時に元のJSONへ戻ってしまう（空文字は偽）。Noneだけを
+        # 「tool呼び出しではなかった」の意味に使い、空文字は素直に除去する。
+        # ```json フェンスごと消さないと、空のフェンスが残って
+        # 「何か喋った」と誤判定される。
+        return match.group(0) if desc is None else desc
 
     text = re.sub(r"```(?:json)?\s*(\{.*?\})\s*```", _replace_fence, text, flags=re.DOTALL)
 
