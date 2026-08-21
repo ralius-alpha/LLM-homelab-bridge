@@ -643,6 +643,37 @@ def start_interactive_chat(model_name: str, exec_mode: str, server_proc,
                     handoff = handoff_from_tool_calls(effective_tool_calls) if not at_max_depth else None
                     if handoff:
                         target_role_id = handoff["role_id"]
+                        # [IMPORTANT] tool定義のenumで引き継ぎ先を制限していても、
+                        # モデルはそれを無視した role_id を平気で書いてくる。
+                        # 特に「自分自身」を指定されると、同じ依頼を延々と自分に
+                        # 渡し続ける無限ループになる（実機で execute→execute→…
+                        # をMAX_CALL_DEPTHまで繰り返す暴走を確認）。
+                        # dispatchする前にcan_handoff_toで検証する。
+                        allowed = role.get("can_handoff_to", [])
+                        if target_role_id not in allowed:
+                            reason = ("自分自身には引き継げません"
+                                      if target_role_id == this_role_id
+                                      else f"{target_role_id}役はあなたの引き継ぎ先ではありません")
+                            notice = (
+                                f"[SYSTEM NOTICE] {reason}。"
+                                f"引き継げるのは次の役だけです: {', '.join(allowed) or '(なし)'}。"
+                                "この一覧に無い役を指定しても実行されません。"
+                                "適切な役を選び直すか、自分でできる範囲の作業を続けるか、"
+                                "これ以上できることが無ければreturn_to_callerで"
+                                "ここまでの状況を報告してください。"
+                            )
+                            print(f"\n[SYSTEM] 無効な引き継ぎ先({target_role_id})を拒否しました。")
+                            append_session_log(log_path, "System", f"無効な引き継ぎ先を拒否: {target_role_id}")
+                            messages.append({"role": "user", "content": notice})
+                            auto_steps += 1
+                            if auto_steps >= MAX_AUTO_STEPS:
+                                print(f"\n[SYSTEM] 物理防御作動: 自動実行が上限({MAX_AUTO_STEPS}回)到達。強制停止します。")
+                                report = _final_report(messages, model_name, debug_mode, chat_log_file)
+                                if is_nested:
+                                    cleaned_up = True
+                                    return teardown(report or "無効な引き継ぎ先の指定が続いたため、途中で強制停止しました。")
+                                break
+                            continue
                         print(f"\n[HANDOFF] {target_role_id}役を呼び出します。理由: {handoff.get('reason') or '(不明)'}")
                         append_role_transition(
                             log_path, "handoff", this_role_id, target_role_id,
