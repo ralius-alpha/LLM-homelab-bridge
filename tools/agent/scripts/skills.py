@@ -122,7 +122,14 @@ def fetch_url(url, max_chars=8000):
     text = re.sub(r"<script[\s\S]*?</script>", "", text, flags=re.IGNORECASE)
     text = re.sub(r"<style[\s\S]*?</style>", "", text, flags=re.IGNORECASE)
     plain = _strip_tags(text)
-    plain = re.sub(r"\n{3,}", "\n\n", plain).strip()
+    # [IMPORTANT] 以前は改行の圧縮(\n{3,} → \n\n)しかしていなかったため、
+    # 「空白だけの行」がそのまま残り続けた。ナビゲーションやレイアウト用の
+    # 空要素が多いページでは max_chars の大半を空白が占めてしまい、
+    # 肝心の本文が切り捨てられる（weathernews.jpで、8084字取得したのに
+    # 気温の表記が1つも含まれない状態を実測で確認した）。
+    # 行単位で空白を潰し、空行を捨ててから字数制限をかける。
+    lines = (re.sub(r"[ \t　 ]+", " ", ln).strip() for ln in plain.splitlines())
+    plain = "\n".join(ln for ln in lines if ln)
 
     if not plain:
         return f"[FETCH] {url} から本文らしきテキストを抽出できませんでした。"
