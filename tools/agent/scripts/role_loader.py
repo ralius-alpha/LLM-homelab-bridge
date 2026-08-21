@@ -44,9 +44,10 @@ def list_role_ids(base_dir):
 
 def _peek_role_meta(base_dir, role_id):
     """
-    role.jsonのdisplay_name/specialtyだけを軽く覗き見る（tool名の検証等はしない）。
+    role.jsonのdisplay_name/specialty/toolsだけを軽く覗き見る（tool名の検証等はしない）。
     handoff_to_roleのtool説明文や自己認識プロンプトに、引き継ぎ先の情報を
-    埋め込むために使う。
+    埋め込むために使う。toolsは「引き継ぎ先がsearch_web等の特定skillを
+    持っているか」の判定（_inject_skill_hint）に使う。
     """
     config_path = os.path.join(base_dir, ROLES_DIRNAME, role_id, ROLE_CONFIG_FILENAME)
     with open(config_path, "r", encoding="utf-8") as f:
@@ -55,6 +56,7 @@ def _peek_role_meta(base_dir, role_id):
         "role_id": role_id,
         "display_name": config.get("display_name", role_id),
         "specialty": config.get("specialty", ""),
+        "tools": config.get("tools", []),
     }
 
 
@@ -78,6 +80,51 @@ def _inject_specialty(prompt, specialty, targets):
         block.append("引き継ぎ先の候補:")
         for t in targets:
             block.append(f"- {t['role_id']}（{t['display_name']}）: {t['specialty']}")
+    return prompt + "\n\n" + "\n".join(block)
+
+
+def _inject_skill_hint(prompt, tool_names, targets):
+    """
+    自分がsearch_webを持っておらず、引き継ぎ先の中にsearch_webを持つ役がいる場合、
+    「調べて」系の依頼をユーザーに投げ返さず必ずhandoff_to_roleで引き継ぐよう
+    明示的に注入する。
+
+    [NOTE] これは全roleのprompt.txtに同じ内容を書き写すのを避けるための共通の
+    仕組み。search_webを持たない役が増えても、各prompt.txtを個別に編集する
+    必要はなく、ここが自動的に対応する。雑談役でこの注意が無いと、モデルが
+    「私は直接検索できません」と答えるだけでhandoff_to_roleを呼ばずに終わる
+    不具合を実機で繰り返し確認した（ユーザーに検索手順を教えて代わりにやらせる
+    のと同種のアンチパターン）。
+    """
+    if "search_web" in tool_names:
+        return prompt
+    search_capable = [t for t in targets if "search_web" in t.get("tools", [])]
+    if not search_capable:
+        return prompt
+    # reviewは読み取り専用の調査役なので、居れば例として優先的に使う
+    # （search_webを持つ役が複数ある場合、execute等の変更系の役より自然）。
+    preferred = next((t for t in search_capable if t["role_id"] == "review"), None)
+    first_target = (preferred or search_capable[0])["role_id"]
+    block = [
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        "【ネット検索が必要な依頼への対応（重要）】",
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        "あなた自身はsearch_webというtoolを持っていない。ユーザーの依頼に"
+        "「調べて」「検索して」「今日の天気は」「最新の〜は」のような、"
+        "あなた自身の知識だけでは答えられない・古い可能性がある情報を"
+        "求める言葉が含まれていたら、「自分では検索できません」で会話を"
+        "終わらせないこと。必ずtool呼び出し機能でhandoff_to_role（"
+        f"role_id=\"{first_target}\"）を実際に呼び出して調べさせること。"
+        "「〜と検索してみてください」のようにユーザー自身に検索させる案内で"
+        "終わるのは誤り（それはあなたの仕事であり、ユーザーにやらせるものではない）。",
+        "正しい返答の一例（これは説明用の記述であり、そのまま文章として書き写す"
+        "ものではない。実際にはtool呼び出し機能そのものを使うこと）:",
+        "```json",
+        '{"name": "handoff_to_role", "arguments": {"role_id": "%s", '
+        '"instructions": "（ユーザーが調べてほしい内容を具体的に）", '
+        '"reason": "自分はsearch_webを持っていないため"}}' % first_target,
+        "```",
+    ]
     return prompt + "\n\n" + "\n".join(block)
 
 
@@ -114,6 +161,7 @@ def load_role(base_dir, role_id):
 
     specialty = config.get("specialty", "")
     prompt = _inject_specialty(prompt, specialty, targets)
+    prompt = _inject_skill_hint(prompt, tool_names, targets)
 
     return {
         "display_name": config.get("display_name", role_id),
