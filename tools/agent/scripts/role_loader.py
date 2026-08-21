@@ -24,11 +24,30 @@ README を参照。
 import os
 import json
 
-from scripts.tools import TOOL_REGISTRY, build_handoff_tool
+from scripts.tools import TOOL_REGISTRY, build_handoff_tool, SKILL_USAGE_NOTES
 
 ROLES_DIRNAME = "roles"
 ROLE_CONFIG_FILENAME = "role.json"
 ROLE_PROMPT_FILENAME = "prompt.txt"
+
+
+def roles_providing_tool(base_dir, role_ids, tool_name):
+    """
+    role_ids の中から、tool_name を実際に持っている役のIDだけを返す。
+
+    雑談役などが「自分は持っていないtool」を直接呼ぼうとした時に、
+    「そのtoolはどの役が持っているのか」を呼び出し元(chat_agent.py)が
+    ユーザー向け/モデル向けの案内に使うためのもの。
+    """
+    owners = []
+    for rid in role_ids or []:
+        try:
+            meta = _peek_role_meta(base_dir, rid)
+        except (OSError, ValueError):
+            continue
+        if tool_name in meta.get("tools", []):
+            owners.append(rid)
+    return owners
 
 
 def list_role_ids(base_dir):
@@ -46,8 +65,8 @@ def _peek_role_meta(base_dir, role_id):
     """
     role.jsonのdisplay_name/specialty/toolsだけを軽く覗き見る（tool名の検証等はしない）。
     handoff_to_roleのtool説明文や自己認識プロンプトに、引き継ぎ先の情報を
-    埋め込むために使う。toolsは「引き継ぎ先がsearch_web等の特定skillを
-    持っているか」の判定（_inject_skill_hint）に使う。
+    埋め込むために使う。toolsは「引き継ぎ先が特定skillを持っているか」の
+    判定（_inject_skill_notes）に使う。
     """
     config_path = os.path.join(base_dir, ROLES_DIRNAME, role_id, ROLE_CONFIG_FILENAME)
     with open(config_path, "r", encoding="utf-8") as f:
@@ -83,48 +102,86 @@ def _inject_specialty(prompt, specialty, targets):
     return prompt + "\n\n" + "\n".join(block)
 
 
-def _inject_skill_hint(prompt, tool_names, targets):
+def _inject_skill_notes(prompt, tool_names, targets):
     """
-    自分がsearch_webを持っておらず、引き継ぎ先の中にsearch_webを持つ役がいる場合、
-    「調べて」系の依頼をユーザーに投げ返さず必ずhandoff_to_roleで引き継ぐよう
-    明示的に注入する。
+    SKILL_USAGE_NOTES（scripts/tools.py）に載っている全skillについて、
+    (a) 自分が持っているものは「使いどころ」を、
+    (b) 自分が持っておらず、引き継ぎ先の誰かが持っているものは「必ず
+        handoff_to_roleで引き継げ」という指示を、
+    それぞれプロンプトに自動注入する。
 
     [NOTE] これは全roleのprompt.txtに同じ内容を書き写すのを避けるための共通の
-    仕組み。search_webを持たない役が増えても、各prompt.txtを個別に編集する
-    必要はなく、ここが自動的に対応する。雑談役でこの注意が無いと、モデルが
-    「私は直接検索できません」と答えるだけでhandoff_to_roleを呼ばずに終わる
-    不具合を実機で繰り返し確認した（ユーザーに検索手順を教えて代わりにやらせる
-    のと同種のアンチパターン）。
+    仕組み。新しいskillが増えても、SKILL_USAGE_NOTESに1エントリ足すだけで
+    このロード処理が自動的に全roleへ反映する（各prompt.txtは個別編集不要）。
+    元々はsearch_web専用のその場しのぎの分岐だった: 雑談役がsearch_webを
+    持たないままユーザーに「調べて」と言われると、「私は直接検索できません」
+    と答えるだけでhandoff_to_roleを呼ばずに終わる不具合を実機で繰り返し
+    確認した（ユーザーに検索手順を教えて代わりにやらせるのと同種の
+    アンチパターン）。これをsearch_webだけ直すのではなく、全skill共通の
+    仕組みとして汎化してある。
     """
-    if "search_web" in tool_names:
+    have_lines = []
+    for name in tool_names:
+        note = SKILL_USAGE_NOTES.get(name)
+        if note:
+            have_lines.append(f"- {name}: {note}")
+
+    missing_hints = []
+    for name, note in SKILL_USAGE_NOTES.items():
+        if name in tool_names:
+            continue
+        # reviewは読み取り専用の調査役なので、居れば引き継ぎ先の例として優先する
+        # （複数の役が同じskillを持つ場合、execute等の変更系の役より自然）。
+        capable = [t for t in targets if name in t.get("tools", [])]
+        if not capable:
+            continue
+        preferred = next((t for t in capable if t["role_id"] == "review"), None)
+        target_id = (preferred or capable[0])["role_id"]
+        missing_hints.append((name, note, target_id))
+
+    if not have_lines and not missing_hints:
         return prompt
-    search_capable = [t for t in targets if "search_web" in t.get("tools", [])]
-    if not search_capable:
-        return prompt
-    # reviewは読み取り専用の調査役なので、居れば例として優先的に使う
-    # （search_webを持つ役が複数ある場合、execute等の変更系の役より自然）。
-    preferred = next((t for t in search_capable if t["role_id"] == "review"), None)
-    first_target = (preferred or search_capable[0])["role_id"]
+
     block = [
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
-        "【ネット検索が必要な依頼への対応（重要）】",
+        "【スキルの使いどころ】",
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
-        "あなた自身はsearch_webというtoolを持っていない。ユーザーの依頼に"
-        "「調べて」「検索して」「今日の天気は」「最新の〜は」のような、"
-        "あなた自身の知識だけでは答えられない・古い可能性がある情報を"
-        "求める言葉が含まれていたら、「自分では検索できません」で会話を"
-        "終わらせないこと。必ずtool呼び出し機能でhandoff_to_role（"
-        f"role_id=\"{first_target}\"）を実際に呼び出して調べさせること。"
-        "「〜と検索してみてください」のようにユーザー自身に検索させる案内で"
-        "終わるのは誤り（それはあなたの仕事であり、ユーザーにやらせるものではない）。",
-        "正しい返答の一例（これは説明用の記述であり、そのまま文章として書き写す"
-        "ものではない。実際にはtool呼び出し機能そのものを使うこと）:",
-        "```json",
-        '{"name": "handoff_to_role", "arguments": {"role_id": "%s", '
-        '"instructions": "（ユーザーが調べてほしい内容を具体的に）", '
-        '"reason": "自分はsearch_webを持っていないため"}}' % first_target,
-        "```",
     ]
+    if have_lines:
+        block.append("あなた自身が使えるスキル:")
+        block.extend(have_lines)
+    if missing_hints:
+        if have_lines:
+            block.append("")
+        block.append(
+            "あなた自身は持っていないが、下記のようなスキルが必要だと"
+            "判断したら、「自分にはできません」で会話を終わらせないこと。"
+            "必ずtool呼び出し機能でhandoff_to_roleを実際に呼び出して"
+            "該当の役に引き継ぐこと（ユーザー自身にやらせる案内で"
+            "終わるのは誤り。それはあなたの仕事であり、ユーザーに"
+            "やらせるものではない）。"
+        )
+        block.append(
+            "[IMPORTANT] 下記のtoolを【あなたが直接呼ぶことはできない】"
+            "（あなたのtool一覧に入っていない）。名前を借りて直接呼び出しても"
+            "何も実行されず、依頼は果たされないまま終わる。使えるのは"
+            "handoff_to_roleだけであり、引き継ぎ先の役がそのtoolを実行する。"
+        )
+        for name, note, target_id in missing_hints:
+            block.append(f"- {name}（{target_id}役が持っている）: {note}")
+        example_name, _, example_target = missing_hints[0]
+        block.append(
+            "正しい返答の一例（これは説明用の記述であり、そのまま文章として"
+            "書き写すものではない。実際にはtool呼び出し機能そのものを"
+            "使うこと）:"
+        )
+        block.append("```json")
+        block.append(
+            '{"name": "handoff_to_role", "arguments": {"role_id": "%s", '
+            '"instructions": "（依頼内容を具体的に）", '
+            '"reason": "自分は%sを持っていないため"}}' % (example_target, example_name)
+        )
+        block.append("```")
     return prompt + "\n\n" + "\n".join(block)
 
 
@@ -161,7 +218,7 @@ def load_role(base_dir, role_id):
 
     specialty = config.get("specialty", "")
     prompt = _inject_specialty(prompt, specialty, targets)
-    prompt = _inject_skill_hint(prompt, tool_names, targets)
+    prompt = _inject_skill_notes(prompt, tool_names, targets)
 
     return {
         "display_name": config.get("display_name", role_id),

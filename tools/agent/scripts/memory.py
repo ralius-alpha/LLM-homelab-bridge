@@ -12,7 +12,7 @@ import os
 from datetime import datetime
 
 from scripts.config import LOGS_DIRNAME, SHARED_MEMORY_FILENAME
-from scripts.tools import strip_think_blocks
+from scripts.tools import strip_think_blocks, strip_tool_call_json
 
 
 def start_session_log(base_dir, role):
@@ -107,6 +107,10 @@ def render_recent_turns(messages, limit=6):
     role=="tool" のメッセージ（他の役からの報告。例えばWriter役が書いた
     記事本文そのもの）を除外すると、2段階の引き継ぎで前の役の成果物が
     次の役に渡らない不具合になる（実機で確認済み）ため、tool役のメッセージも含める。
+
+    [IMPORTANT] 生のtool呼び出しJSONは strip_tool_call_json() で落とす。
+    残したままにすると、引き継ぎ先の役がそれを丸写しして同じtool呼び出しを
+    繰り返す（実機で execute→execute の自己引き継ぎ暴走を確認）。
     """
     turns = [
         m for m in messages
@@ -115,7 +119,7 @@ def render_recent_turns(messages, limit=6):
     recent = turns[-limit:]
     lines = []
     for m in recent:
-        text = strip_think_blocks(m["content"])
+        text = strip_tool_call_json(strip_think_blocks(m["content"]))
         if not text:
             continue
         if m["role"] == "user":

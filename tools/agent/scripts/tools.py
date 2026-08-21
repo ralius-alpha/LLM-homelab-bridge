@@ -270,6 +270,51 @@ GIT_DIFF_SUMMARY_TOOL = {
 }
 
 
+# 「スキル」（副作用が無い/軽い、単独で完結する能力。README「役とスキルの違い」参照）
+# 1つにつき、「いつ使うべきか／使うべきでないか」を短くまとめたノート。
+# tool定義の"description"はOllamaに渡すJSONスキーマの一部であり、そこに全部
+# 詰め込むと肥大化する上、role.jsonでこのskillを持たない役には一切見えない
+# （toolsに入っていないtoolの説明はモデルに渡らないため）。ここは別枠にして
+# scripts/role_loader.pyがロール読み込み時に、(a) そのskillを持つ役には
+# 「使いどころ」として、(b) 持たないが引き継ぎ先が持つ役には「該当スキルが
+# 必要な依頼が来たらhandoff_to_roleで引き継げ」として、両方に自動注入する。
+# [NOTE] 新しいskillを追加する時は、実装(scripts/skills.py)・スキーマ(本ファイル
+# 上部のTOOL定義+TOOL_REGISTRY)に加えて、必ずここにも1エントリ追加すること
+# （README「新しいスキルを追加するには」参照）。追加を忘れると、そのskillを
+# 持たない役は「そんなことはできません」と会話を終わらせるだけで、
+# handoff_to_roleで引き継ぐべき場面だと気づけない（雑談役でsearch_webに
+# ついて実機で確認した不具合と同じパターンが、他のskillでも起こり得る）。
+SKILL_USAGE_NOTES = {
+    "search_web": (
+        "使うべき場合: 「調べて」「検索して」「今日の〜は」「最新の〜は」など、"
+        "自分の知識だけでは答えられない・古い可能性がある情報が要る時。"
+        "使うべきでない場合: PC上のファイルで完結する調査（read_file/execute_command）や、"
+        "一般的な設計相談・雑談。"
+    ),
+    "fetch_url": (
+        "使うべき場合: search_webの結果に出てきたURLや、ユーザーから提示されたURLの"
+        "中身を実際に読みたい時。"
+        "使うべきでない場合: まだURLが手元に無い時（先にsearch_webでURLを見つける）。"
+    ),
+    "summarize_text": (
+        "使うべき場合: read_file/fetch_url/search_webで読んだ内容が長すぎて、"
+        "そのまま扱うと会話が長くなりすぎる時。"
+        "使うべきでない場合: 既に十分短い内容や、要約ではなく原文の正確な引用が必要な時。"
+    ),
+    "calculate": (
+        "使うべき場合: 桁数の大きい計算や、暗算で間違えやすい四則演算・べき乗の計算をする時。"
+        "使うべきでない場合: 変数を含む式やプログラムの実行が必要な時"
+        "（calculateは四則演算・べき乗のみで、任意のコード実行はできない）。"
+    ),
+    "git_diff_summary": (
+        "使うべき場合: コミット前に変更内容を確認したい時、レビューでどこが"
+        "変わったか把握したい時。"
+        "使うべきでない場合: gitで管理されていない一時ファイルの内容確認"
+        "（そちらはread_fileを使う）。"
+    ),
+}
+
+
 def build_handoff_tool(targets):
     """
     handoff_to_role のtool定義を動的に作る。
@@ -340,6 +385,71 @@ def strip_think_blocks(text: str) -> str:
     cleaned = re.sub(r"<think>.*", "", cleaned, flags=re.DOTALL | re.IGNORECASE)
     cleaned = cleaned.replace("</think>", "")
     return cleaned.strip()
+
+
+def strip_tool_call_json(text: str) -> str:
+    """
+    会話の抜粋から、tool呼び出しのJSONそのものを取り除き、短い説明に置き換える。
+
+    [IMPORTANT] 引き継ぎ先に渡す「直近の会話の抜粋」(scripts.memory.
+    render_recent_turns)に、呼び出し元が出した生のtool呼び出しJSONが
+    そのまま載っていると、受け取った役がそれを【お手本として丸写し】する。
+    実機で、雑談役の
+      {"name":"handoff_to_role","arguments":{"role_id":"execute",...}}
+    というJSONが抜粋に含まれた結果、引き継ぎ先のExecute役が同じJSONを
+    そのまま出力して自分自身に引き継ぎ続け、MAX_CALL_DEPTHに達するまで
+    モデルのロード/アンロードを繰り返す暴走を確認した。
+    抜粋は「何を話したか」を伝えるためのものであり、機械向けの命令文を
+    そのまま見せる必要は無いので、ここで落とす。
+    """
+    if not text:
+        return text
+
+    def _describe(obj):
+        name = obj.get("name")
+        return f"（{name} のtool呼び出しを実行）" if name else None
+
+    def _try_parse(candidate):
+        try:
+            obj = json.loads(candidate)
+        except (json.JSONDecodeError, TypeError):
+            return None
+        if not isinstance(obj, dict):
+            return None
+        if "name" not in obj or "arguments" not in obj:
+            return None
+        return obj
+
+    # 1) ```json ... ``` フェンスで囲まれたtool呼び出し
+    def _replace_fence(match):
+        obj = _try_parse(match.group(1).strip())
+        if obj is None:
+            return match.group(0)
+        return _describe(obj) or match.group(0)
+
+    text = re.sub(r"```(?:json)?\s*(\{.*?\})\s*```", _replace_fence, text, flags=re.DOTALL)
+
+    # 2) フェンス無しで裸のまま書かれたtool呼び出し（波括弧の対応を数えて拾う）
+    out = []
+    depth = 0
+    start = None
+    for i, ch in enumerate(text):
+        if ch == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "}":
+            if depth > 0:
+                depth -= 1
+                if depth == 0 and start is not None:
+                    obj = _try_parse(text[start:i + 1])
+                    out.append(_describe(obj) if obj else text[start:i + 1])
+                    start = None
+        elif depth == 0:
+            out.append(ch)
+    if start is not None:  # 閉じていない波括弧はそのまま残す
+        out.append(text[start:])
+    return "".join(p for p in out if p is not None).strip()
 
 
 def tool_calls_to_actions(tool_calls):
