@@ -30,6 +30,24 @@ ROLES_DIRNAME = "roles"
 ROLE_CONFIG_FILENAME = "role.json"
 ROLE_PROMPT_FILENAME = "prompt.txt"
 
+# すべての役が最初から持っている「一般的な能力」。
+#
+# [IMPORTANT] 設計の根幹。人間でも、調べ物・電卓・要約は誰でもやることであって、
+# 「検索できる人」という専門職を立てたりはしない。役を分ける理由になるのは
+# 特異なこと（その役の専門性）と、危険な権限（コマンド実行・ファイル編集）だけ。
+#
+# 以前はこれらのtoolを役ごとにバラバラに持たせていた（planにはsearch_webが
+# あるがfetch_urlは無い、testには両方無い、writerにはsummarize_textがあるが
+# calculateは無い…といった、根拠の無い差）。その結果、
+# 【本来は存在しないはずの能力ギャップ】が人工的に生まれ、それが引き継ぎの
+# 理由になってしまっていた。実機では、search_webを持っている3役が揃って
+# 「私は検索できません」と言い合ってたらい回しする所まで悪化した。
+#
+# 引き継ぎは「toolが無いから」ではなく、「難しいと判断したとき」
+# 「自分でやって失敗が続いたとき」に起きるべきもの。そのための土台として、
+# 一般的な能力は全員に配る。
+COMMON_SKILLS = ["search_web", "fetch_url", "summarize_text", "calculate", "remember"]
+
 
 def role_tool_names(base_dir, role_id):
     """
@@ -88,11 +106,19 @@ def _peek_role_meta(base_dir, role_id):
     config_path = os.path.join(base_dir, ROLES_DIRNAME, role_id, ROLE_CONFIG_FILENAME)
     with open(config_path, "r", encoding="utf-8") as f:
         config = json.load(f)
+    # [IMPORTANT] role.jsonの"tools"はその役に固有のtoolしか書かない。
+    # ここで返すのは「実際にその役が使えるtool一覧」でなければならない
+    # （load_role と同じく COMMON_SKILLS を合成する）。合成を忘れると、
+    # 引き継ぎ指示書に載る「あなたが使えるtool」から一般スキルが抜け落ち、
+    # 受け取った役が「自分はsearch_webを持っていない」と誤解する——
+    # まさに直したはずの能力の誤申告を再発させる（単体テストで検出済み）。
+    declared = config.get("tools", [])
+    tools = list(COMMON_SKILLS) + [t for t in declared if t not in COMMON_SKILLS]
     return {
         "role_id": role_id,
         "display_name": config.get("display_name", role_id),
         "specialty": config.get("specialty", ""),
-        "tools": config.get("tools", []),
+        "tools": tools,
         "can_handoff_to": config.get("can_handoff_to", []),
     }
 
@@ -122,21 +148,20 @@ def _inject_specialty(prompt, specialty, targets):
 
 def _inject_skill_notes(prompt, tool_names, targets):
     """
-    SKILL_USAGE_NOTES（scripts/tools.py）に載っている全skillについて、
-    (a) 自分が持っているものは「使いどころ」を、
-    (b) 自分が持っておらず、引き継ぎ先の誰かが持っているものは「必ず
-        handoff_to_roleで引き継げ」という指示を、
-    それぞれプロンプトに自動注入する。
+    「自分に何ができるか」と「どういう時に他の役へ引き継ぐか」をプロンプトに注入する。
 
-    [NOTE] これは全roleのprompt.txtに同じ内容を書き写すのを避けるための共通の
-    仕組み。新しいskillが増えても、SKILL_USAGE_NOTESに1エントリ足すだけで
-    このロード処理が自動的に全roleへ反映する（各prompt.txtは個別編集不要）。
-    元々はsearch_web専用のその場しのぎの分岐だった: 雑談役がsearch_webを
-    持たないままユーザーに「調べて」と言われると、「私は直接検索できません」
-    と答えるだけでhandoff_to_roleを呼ばずに終わる不具合を実機で繰り返し
-    確認した（ユーザーに検索手順を教えて代わりにやらせるのと同種の
-    アンチパターン）。これをsearch_webだけ直すのではなく、全skill共通の
-    仕組みとして汎化してある。
+    [IMPORTANT] 設計の要。引き継ぎの判断基準は【toolの有無ではない】。
+    一般的な能力(COMMON_SKILLS)は全役が最初から持っているので、
+    「そのtoolを持っていないから引き継ぐ」という理由は原則として成り立たない。
+    引き継ぐのは、(1)自分の権限では実行できない作業が要るとき、
+    (2)自分で試したが失敗が続いて手詰まりになったとき、
+    (3)明らかに他の役の専門性が要るとき、の3つ。
+
+    以前は逆に「持っていないtoolがあれば引き継げ」と書いていた。役ごとに
+    読み取り専用toolがバラバラに欠けていた時代の名残で、実在しない能力
+    ギャップを引き継ぎの口実にしてしまっていた（実機で、search_webを
+    持っている3役が揃って「私は検索できません」と言い合い、たらい回しの
+    末にMAX_CALL_DEPTHで打ち止めになる所まで悪化した）。
     """
     have_lines = []
     for name in tool_names:
@@ -144,62 +169,63 @@ def _inject_skill_notes(prompt, tool_names, targets):
         if note:
             have_lines.append(f"- {name}: {note}")
 
-    missing_hints = []
-    for name, note in SKILL_USAGE_NOTES.items():
-        if name in tool_names:
-            continue
-        # reviewは読み取り専用の調査役なので、居れば引き継ぎ先の例として優先する
-        # （複数の役が同じskillを持つ場合、execute等の変更系の役より自然）。
-        capable = [t for t in targets if name in t.get("tools", [])]
-        if not capable:
-            continue
-        preferred = next((t for t in capable if t["role_id"] == "review"), None)
-        target_id = (preferred or capable[0])["role_id"]
-        missing_hints.append((name, note, target_id))
+    # 自分に無く、引き継ぎ先が持っている「権限系」のtool。
+    # 一般的なスキルは全員が持っているので、ここに残るのは本当に権限の差だけ。
+    # [NOTE] return_to_caller / handoff_to_role は「能力」ではなく会話を
+    # 受け渡すための制御用。雑談役は連鎖の起点で戻る先が無いため
+    # return_to_callerを持たないが、それを「権限が無い作業」として
+    # 挙げるのは誤解のもとなので除く。
+    control_tools = {"return_to_caller", "handoff_to_role"}
+    privileged = []
+    for t in targets:
+        for name in t.get("tools", []):
+            if name in tool_names or name in SKILL_USAGE_NOTES or name in control_tools:
+                continue
+            privileged.append((name, t["role_id"]))
+    owners = {}
+    for name, rid in privileged:
+        owners.setdefault(name, []).append(rid)
 
-    if not have_lines and not missing_hints:
+    if not have_lines and not owners:
         return prompt
 
     block = [
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
-        "【スキルの使いどころ】",
+        "【自分にできること／他の役に頼るとき】",
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
     ]
     if have_lines:
-        block.append("あなた自身が使えるスキル:")
+        block.append("あなたが使えるスキルと、その使いどころ:")
         block.extend(have_lines)
-    if missing_hints:
-        if have_lines:
-            block.append("")
+        block.append("")
+    block.append(
+        "[IMPORTANT] 上に挙げた一般的なスキル（検索・ページ取得・要約・計算など）は"
+        "【すべての役が最初から持っている】。したがって「そのtoolを持っていないから」"
+        "という理由で他の役に引き継ぐのは誤り。まず自分でやってみること。"
+        "ユーザーに「ご自身で検索してください」のような案内をして終わるのは"
+        "もっと悪い（それはあなたの仕事であり、ユーザーにやらせるものではない）。"
+    )
+    if owners:
+        block.append("")
         block.append(
-            "あなた自身は持っていないが、下記のようなスキルが必要だと"
-            "判断したら、「自分にはできません」で会話を終わらせないこと。"
-            "必ずtool呼び出し機能でhandoff_to_roleを実際に呼び出して"
-            "該当の役に引き継ぐこと（ユーザー自身にやらせる案内で"
-            "終わるのは誤り。それはあなたの仕事であり、ユーザーに"
-            "やらせるものではない）。"
+            "あなたには権限が無く、他の役だけができる作業:"
         )
+        for name, rids in sorted(owners.items()):
+            block.append(f"- {name}（{'・'.join(sorted(set(rids)))}役ができる）")
         block.append(
-            "[IMPORTANT] 下記のtoolを【あなたが直接呼ぶことはできない】"
-            "（あなたのtool一覧に入っていない）。名前を借りて直接呼び出しても"
-            "何も実行されず、依頼は果たされないまま終わる。使えるのは"
-            "handoff_to_roleだけであり、引き継ぎ先の役がそのtoolを実行する。"
+            "これらが必要になったら、名前を借りて自分で呼んでも実行されない。"
+            "handoff_to_role で該当の役に引き継ぐこと。"
         )
-        for name, note, target_id in missing_hints:
-            block.append(f"- {name}（{target_id}役が持っている）: {note}")
-        example_name, _, example_target = missing_hints[0]
-        block.append(
-            "正しい返答の一例（これは説明用の記述であり、そのまま文章として"
-            "書き写すものではない。実際にはtool呼び出し機能そのものを"
-            "使うこと）:"
-        )
-        block.append("```json")
-        block.append(
-            '{"name": "handoff_to_role", "arguments": {"role_id": "%s", '
-            '"instructions": "（依頼内容を具体的に）", '
-            '"reason": "自分は%sを持っていないため"}}' % (example_target, example_name)
-        )
-        block.append("```")
+    block.append("")
+    block.append("他の役に引き継ぐのは、次のどれかに当てはまる時だけでよい:")
+    block.append("1. 自分の権限では実行できない作業が必要なとき（上記）。")
+    block.append("2. 自分で何度か試したが失敗が続き、手詰まりになったとき。")
+    block.append("3. 明らかにその役の専門性が必要なとき。")
+    block.append(
+        "逆に、自分のスキルで片付くなら引き継がずに自分で終わらせること。"
+        "引き継ぎはモデルの入れ替えを伴い時間がかかるので、"
+        "「念のため」で渡さないこと。"
+    )
     return prompt + "\n\n" + "\n".join(block)
 
 
@@ -219,7 +245,12 @@ def load_role(base_dir, role_id):
     with open(prompt_path, "r", encoding="utf-8") as f:
         prompt = f.read().strip()
 
-    tool_names = config.get("tools", [])
+    # role.json が宣言するのは「その役に固有のtool」だけでよい。
+    # 一般的な能力(COMMON_SKILLS)は全役に自動で付与する。
+    declared = config.get("tools", [])
+    tool_names = list(COMMON_SKILLS)
+    tool_names += [name for name in declared if name not in tool_names]
+
     unknown = [name for name in tool_names if name not in TOOL_REGISTRY]
     if unknown:
         raise ValueError(

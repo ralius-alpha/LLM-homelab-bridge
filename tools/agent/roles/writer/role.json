@@ -2,7 +2,7 @@
   "display_name": "Writer役",
   "specialty": "コードや作業ログ、会話の内容を、読みやすい説明文・記事として書き起こす。ファイルの編集は行わない（書いた文章そのものを報告として返す）。",
   "model": "qwen2.5-coder:14b",
-  "tools": ["read_file", "search_web", "fetch_url", "summarize_text", "remember", "return_to_caller"],
+  "tools": ["read_file", "return_to_caller"],
   "module": "arc_agent",
   "can_handoff_to": ["execute", "review", "plan", "debug", "test"]
 }

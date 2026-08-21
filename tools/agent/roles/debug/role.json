@@ -2,7 +2,7 @@
   "display_name": "Debug役",
   "specialty": "エラーメッセージやログを読み、コマンドで再現・調査して原因を特定する。原因の特定と報告が仕事で、修正はしない。",
   "model": "qwen2.5-coder:14b",
-  "tools": ["read_file", "execute_command", "search_web", "fetch_url", "remember", "return_to_caller"],
+  "tools": ["read_file", "execute_command", "return_to_caller"],
   "module": "arc_agent",
   "can_handoff_to": ["execute", "review", "plan", "writer", "test"]
 }
