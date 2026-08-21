@@ -173,6 +173,18 @@ def _run_chat_skill(act, model_name):
     return res
 
 
+def _tried_summary(skill_cache):
+    """このターンで既に試した呼び出しを、人が読める形に並べる。"""
+    label = {"search": "検索", "fetch_url": "本文取得",
+             "calculate": "計算", "summarize": "要約"}
+    lines = []
+    for key in skill_cache:
+        kind = label.get(key[0], key[0])
+        arg = key[1] if len(key) > 1 else ""
+        lines.append(f"- {kind}: {arg}" if arg else f"- {kind}")
+    return "\n".join(lines)
+
+
 def _skill_cache_key(act):
     """
     スキル呼び出しを「同じ呼び出しかどうか」で識別するキーを作る。
@@ -431,13 +443,29 @@ def run_chat_loop(model_name, server_proc, log_path):
                     for a in skill_acts:
                         key = _skill_cache_key(a)
                         if key in skill_cache:
+                            # [IMPORTANT] ここで「前回の結果を使って答えて」と返すのは誤り。
+                            # モデルは多くの場合、その結果に欲しい情報が無かったからこそ
+                            # やり直そうとしている。行き止まりに押し返すことになり、
+                            # 実機では同じ検索を上限まで繰り返し続けた。
+                            # 必要なのは「同じ手は無駄」ではなく「別の手に切り替えろ」で、
+                            # そのために既に試したことを具体的に示す。
                             feedback_parts.append(
                                 f"[SYSTEM NOTICE] その {a['type']} は、このやり取りの中で"
-                                "既に同じ引数で実行済みです。呼び直しても結果は変わりません。"
-                                "以下は前回の結果なので、これを使って答えてください。\n"
-                                + skill_cache[key]
+                                "既に同じ引数で実行済みです。実行自体は成功しており、"
+                                "同じ引数で呼び直しても全く同じ結果が返るだけで前に進みません。"
+                                "（結果は上のやり取りに残っているので読み返せます）\n"
+                                f"このやり取りで既に試したこと:\n{_tried_summary(skill_cache)}\n"
+                                "欲しい情報が得られなかったのは、呼び出しが失敗したからではなく"
+                                "「取得できた内容にその情報が無かった」からです。"
+                                "同じ手を繰り返さず、必ず別の手に切り替えてください:\n"
+                                "(a) 検索結果に出ていた【まだ試していない別のURL】をfetch_urlする\n"
+                                "(b) 【違うキーワード】で検索し直す"
+                                "（地名を足す・「気温」「予報」等の語を足す・表現を変える）\n"
+                                "(c) それでも分からなければ、分かった範囲と"
+                                "分からなかった点を正直に答える\n"
+                                "上の(a)(b)(c)のいずれかを選ぶこと。同じ呼び出しの再実行は選択肢にありません。"
                             )
-                            print(f"\n[SYSTEM] 実行済みの {a['type']} を再要求されました。前回の結果を返します。")
+                            print(f"\n[SYSTEM] 実行済みの {a['type']} を再要求されました。別の手を促します。")
                             continue
                         res = _run_chat_skill(a, model_name)
                         if res is None:
