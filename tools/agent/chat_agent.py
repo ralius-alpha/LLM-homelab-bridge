@@ -45,7 +45,7 @@ from scripts.tools import (
     handoff_from_tool_calls,
 )
 from scripts.display import stream_chat_response
-from scripts.role_loader import load_role
+from scripts.role_loader import load_role, roles_providing_tool
 from scripts.dispatch import invoke_role
 from scripts.memory import (
     start_session_log,
@@ -85,6 +85,79 @@ CHAT_MODEL = ROLE["model"]
 # ため気づきにくい）。arc_agent.py側は元からnum_ctxを明示していたが、
 # chat_agent.py側は抜けていたため揃える。
 CHAT_NUM_CTX = 8192
+
+# [IMPORTANT] 以前はここが 0.6 だった（雑談の自然さを狙って高めにしていた）。
+# しかし実機テストで、雑談役だけが「Review役に引き継ぐことができます。手順を
+# 教えていただきますか？」のような【会話文】を返すだけで、実際の
+# handoff_to_role のtool呼び出しを出さない不具合を繰り返し確認した。
+# arc_agent.py側の6役はすべて temperature 0.2 で、同じモデル
+# (qwen2.5-coder:14b)にもかかわらずtool呼び出しは安定して出せている。
+# tool呼び出しは構造化されたJSONの生成であり、温度が高いほど崩れやすい。
+# 失敗しているのが「0.6の役だけ」という切り分けができているため、
+# 動いている側(0.2)に揃える。repeat_penaltyも同じ理由で揃える。
+CHAT_TEMPERATURE = 0.2
+CHAT_REPEAT_PENALTY = 1.15
+
+# 「引き継ぎます」と言いながらtool呼び出しを出さなかった時や、
+# 自分が持っていないtoolを直接呼ぼうとした時に、促して作り直させる回数の上限。
+# 無限に促すと会話が進まなくなるため1回だけ。
+MAX_HANDOFF_NUDGES = 1
+
+# 雑談役がこのファイルの会話ループで実際に処理できるtool。
+# [IMPORTANT] これ以外のtool呼び出しが来たら、それは雑談役が持っていない
+# toolを名前だけ借りて呼ぼうとしている（実機で summarize_text を直接
+# 呼ぼうとするのを確認）。以前は黙って捨てていたため、ユーザーには生の
+# JSONだけが表示され、依頼は果たされないまま終わっていた。
+SERVICEABLE_TOOL_NAMES = {"remember", "handoff_to_role"}
+
+
+def _called_tool_names(tool_calls):
+    """tool_callsから呼び出されたtool名の一覧を取り出す。"""
+    names = []
+    for tc in tool_calls or []:
+        name = (tc.get("function") or {}).get("name")
+        if isinstance(name, str) and name:
+            names.append(name)
+    return names
+
+
+# 「自分ではできない/他の役に引き継ぐ」という【意図】が本文に出ているかを見る
+# パターン。tool呼び出しが1つも無い返答に対してのみ使う（下記
+# _looks_like_unfulfilled_handoff 参照）。
+_HANDOFF_INTENT_PATTERNS = (
+    "引き継",
+    "引継",
+    "役に頼",
+    "役に依頼",
+    "役にお願い",
+    "役を呼",
+    "私は直接",
+    "私には直接",
+    "自分では",
+    "自分には",
+    "検索してみてください",
+    "調べてみてください",
+    "確認してみてください",
+)
+
+
+def _looks_like_unfulfilled_handoff(text: str) -> bool:
+    """
+    「他の役に引き継ぐ」「自分では出来ない」と会話文で述べているのに、
+    実際のtool呼び出しが1つも無い返答かどうかを判定する。
+
+    [NOTE] プロンプト側で「必ずtool呼び出し機能そのものを使うこと」と
+    何度強調しても、小型モデルでは確率的にしか守られないことを今夜
+    繰り返し確認している（roles/*/prompt.txt の【絶対ルール】、
+    role_loader._inject_skill_notes のいずれも、単独では取りこぼす）。
+    そのため「言ったのにやっていない」状態をコード側で検知して、
+    1回だけ促し直す保険をかける。これはこのプロジェクトで一貫して
+    採ってきた「プロンプトでの軽減＋コードでの保険」の方針に沿う
+    （arc_agent.py の MAX_AUTO_STEPS / MAX_FAILURE_STREAK 等と同じ考え方）。
+    """
+    if not text:
+        return False
+    return any(pattern in text for pattern in _HANDOFF_INTENT_PATTERNS)
 
 
 def run_role_and_wait(server_proc, role_id, instructions, log_path):
@@ -156,34 +229,97 @@ def run_chat_loop(model_name, server_proc, log_path):
             messages.append({"role": "user", "content": user_input})
             append_session_log(log_path, "User", user_input)
 
-            payload = json.dumps({
-                "model": model_name,
-                "messages": messages,
-                "tools": ROLE["tools"],
-                "stream": True,
-                "keep_alive": KEEP_ALIVE,
-                "options": {"temperature": 0.6, "top_p": 0.9, "num_ctx": CHAT_NUM_CTX},
-            }).encode("utf-8")
-            req = urllib.request.Request(
-                f"{OLLAMA_HOST}/api/chat", data=payload,
-                headers={"Content-Type": "application/json"})
+            # [NOTE] 「引き継ぐと言ったのにtool呼び出しが無い」場合に1回だけ
+            # 促し直すため、モデル呼び出しをループにしてある（通常は1周で抜ける）。
+            nudges_used = 0
+            while True:
+                payload = json.dumps({
+                    "model": model_name,
+                    "messages": messages,
+                    "tools": ROLE["tools"],
+                    "stream": True,
+                    "keep_alive": KEEP_ALIVE,
+                    "options": {
+                        "temperature": CHAT_TEMPERATURE,
+                        "top_p": 0.9,
+                        "repeat_penalty": CHAT_REPEAT_PENALTY,
+                        "num_ctx": CHAT_NUM_CTX,
+                    },
+                }).encode("utf-8")
+                req = urllib.request.Request(
+                    f"{OLLAMA_HOST}/api/chat", data=payload,
+                    headers={"Content-Type": "application/json"})
 
-            print("\n--- Response ---")
-            try:
-                content, tool_calls = stream_chat_response(req)
-            except urllib.error.URLError as e:
-                print(f"\n[ERROR] 通信エラー: {e}")
-                cleaned_up = True
-                teardown()
-                return
+                print("\n--- Response ---")
+                try:
+                    content, tool_calls = stream_chat_response(req)
+                except urllib.error.URLError as e:
+                    print(f"\n[ERROR] 通信エラー: {e}")
+                    cleaned_up = True
+                    teardown()
+                    return
 
-            assistant_msg = {"role": "assistant", "content": content}
-            if tool_calls:
-                assistant_msg["tool_calls"] = tool_calls
-            messages.append(assistant_msg)
-            append_session_log(log_path, "Assistant", strip_think_blocks(content) or "(tool呼び出しのみ)")
+                assistant_msg = {"role": "assistant", "content": content}
+                if tool_calls:
+                    assistant_msg["tool_calls"] = tool_calls
+                messages.append(assistant_msg)
+                append_session_log(log_path, "Assistant", strip_think_blocks(content) or "(tool呼び出しのみ)")
 
-            effective_tool_calls = tool_calls or tool_call_from_content(content)
+                effective_tool_calls = tool_calls or tool_call_from_content(content)
+
+                # --- 物理防御: 依頼が無言で取りこぼされる2種類のパターンを検知し、
+                # 1回だけ促して作り直させる ---
+                called_names = _called_tool_names(effective_tool_calls)
+                unavailable = [n for n in called_names if n not in SERVICEABLE_TOOL_NAMES]
+
+                # 何か1つでもこのループで処理できるtoolがあれば、通常処理へ進む。
+                if any(n in SERVICEABLE_TOOL_NAMES for n in called_names):
+                    break
+                if nudges_used >= MAX_HANDOFF_NUDGES:
+                    break
+
+                if unavailable:
+                    # パターン1: 自分が持っていないtoolを名前だけ借りて直接呼んだ。
+                    owners = []
+                    for name in unavailable:
+                        owners.extend(roles_providing_tool(
+                            BASE_DIR, ROLE.get("can_handoff_to", []), name))
+                    owner_hint = (
+                        f"（{'・'.join(sorted(set(owners)))}役が持っています）"
+                        if owners else ""
+                    )
+                    nudge = (
+                        f"[SYSTEM NOTICE] あなたは {', '.join(unavailable)} を直接"
+                        f"呼び出そうとしましたが、それはあなたが使えるtoolでは"
+                        f"ありません{owner_hint}。そのため今の呼び出しは実行されず、"
+                        "ユーザーの依頼は果たされていません。あなたが使えるのは "
+                        "handoff_to_role と remember だけです。そのtoolを持つ役に"
+                        "handoff_to_role で引き継ぐか、会話だけで答えられる内容なら"
+                        "tool を使わず普通の会話文で答えてください。"
+                    )
+                    print(f"\n[SYSTEM] 使えないtool({', '.join(unavailable)})を呼ぼうとしました。促し直します。")
+                    append_session_log(
+                        log_path, "System",
+                        f"使用不可のtool呼び出しを検知({', '.join(unavailable)})のため促し直し")
+                elif _looks_like_unfulfilled_handoff(strip_think_blocks(content)):
+                    # パターン2: 「引き継ぎます」と会話文で述べたのにtool呼び出しが無い。
+                    nudge = (
+                        "[SYSTEM NOTICE] あなたは今の返答で「他の役に引き継ぐ」または"
+                        "「自分では対応できない」と述べましたが、実際のtool呼び出しが"
+                        "1つも行われていません。会話文でそう書くだけでは何も実行されず、"
+                        "ユーザーの依頼は果たされないままです。"
+                        "ユーザーに手順を尋ね返したり、ユーザー自身にやらせる案内をしたり"
+                        "せず、今すぐtool呼び出し機能そのものを使って handoff_to_role を"
+                        "呼び出してください（引き継ぎ先・具体的な作業指示・理由を引数に"
+                        "入れること）。"
+                    )
+                    print("\n[SYSTEM] 引き継ぐと述べましたが実際のtool呼び出しがありません。促し直します。")
+                    append_session_log(log_path, "System", "引き継ぎ意図はあるがtool呼び出しが無いため促し直し")
+                else:
+                    break
+
+                nudges_used += 1
+                messages.append({"role": "user", "content": nudge})
 
             # [IMPORTANT] handoff_to_roleをremember等より先にチェックしていると、
             # 1回の返答でhandoff_to_role + rememberがまとめて出た時、handoffだけが
@@ -199,6 +335,24 @@ def run_chat_loop(model_name, server_proc, log_path):
                     remembered = True
 
             handoff = handoff_from_tool_calls(effective_tool_calls)
+            if handoff and handoff["role_id"] not in ROLE.get("can_handoff_to", []):
+                # [IMPORTANT] tool定義のenumで制限していても、モデルはそれを無視した
+                # role_idを書いてくる（arc_agent.py側で自己引き継ぎの暴走を実機確認）。
+                # 存在しない/許可されていない役をdispatchしようとすると
+                # importlibのImportErrorになるだけなので、手前で弾いて説明を返す。
+                bad = handoff["role_id"]
+                allowed = ROLE.get("can_handoff_to", [])
+                print(f"\n[SYSTEM] 無効な引き継ぎ先({bad})が指定されました。")
+                append_session_log(log_path, "System", f"無効な引き継ぎ先を拒否: {bad}")
+                messages.append({"role": "user", "content": (
+                    f"[SYSTEM NOTICE] {bad}役はあなたの引き継ぎ先ではないため、"
+                    f"引き継ぎは行われませんでした。引き継げるのは次の役だけです: "
+                    f"{', '.join(allowed) or '(なし)'}。適切な役を選び直すか、"
+                    "会話だけで答えられる内容なら普通の会話文で答えてください。"
+                )})
+                print("[雑談役] （引き継ぎ先の指定が正しくありませんでした。もう一度話しかけてください）")
+                continue
+
             if handoff:
                 role_id = handoff["role_id"]
                 print(f"\n[HANDOFF] {role_id}役を呼び出します。理由: {handoff.get('reason') or '(不明)'}")
