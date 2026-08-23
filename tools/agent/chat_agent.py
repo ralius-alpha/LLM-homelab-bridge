@@ -58,6 +58,7 @@ from scripts.memory import (
     build_system_prompt_with_memory,
     render_recent_turns,
     build_handoff_brief,
+    current_time_note,
 )
 
 # 思考モデルは、日本語Windowsのコンソール既定(cp932)では表示できない文字
@@ -413,7 +414,11 @@ def run_chat_loop(model_name, server_proc, log_path):
             if not user_input:
                 continue
 
-            messages.append({"role": "user", "content": user_input})
+            # [NOTE] 発言ごとに現在日時を添える。モデルは自分が動いている日時を
+            # 知らないため、これが無いと「今日のイベントは？」に答えられず
+            # ユーザーに日付を聞き返してしまう（詳細は current_time_note）。
+            messages.append({"role": "user",
+                             "content": f"{user_input}\n{current_time_note()}"})
             append_session_log(log_path, "User", user_input)
 
             # [NOTE] このループは1周で抜けるのが普通。周回するのは

@@ -108,6 +108,26 @@ BRIEF_EXCERPT_HEADER = "[直前までの会話の抜粋（参考。要約では�
 BRIEF_INSTRUCTION_HEADER = "[今回の具体的な作業指示]"
 
 
+_WEEKDAY_JA = "月火水木金土日"
+
+
+def current_time_note():
+    """
+    「今が何日の何時か」をモデルに伝える一行を返す。
+
+    [IMPORTANT] モデルは自分が動いている日時を知らない。「今日のイベントは？」
+    「最新の〜は？」のような依頼は、今日が何日か分からないと調べようがなく、
+    実機では「今日は何月何日でしょうか？」とユーザーに聞き返してしまった
+    （ユーザーが答えるまで何もできない、という無駄なやり取りになる）。
+
+    セッション開始時にシステムプロンプトへ一度だけ書く方法だと、日をまたぐ
+    長い会話で古くなるうえ、会話が伸びるほど古い位置に埋もれる。
+    ユーザーの発言ごとに付ければ常に最新で、かつ一番読まれる位置に入る。
+    """
+    now = datetime.now()
+    return f"[現在日時: {now:%Y-%m-%d %H:%M} ({_WEEKDAY_JA[now.weekday()]}曜日)]"
+
+
 def _flatten_handoff_brief(text):
     """
     引き継ぎ指示書を、その中の「今回の具体的な作業指示」だけに畳む。
@@ -161,6 +181,11 @@ def build_handoff_brief(target_tool_names, root_request, context, instructions):
         )
     if context:
         parts.append(f"{BRIEF_EXCERPT_HEADER}\n{context}")
+    # [IMPORTANT] 現在日時は「作業指示」より前に置く。指示書を抜粋に載せる時は
+    # _flatten_handoff_brief が作業指示セクション以降だけを残すので、後ろに
+    # 置くと日時まで一緒に引きずられ、連鎖が進むほど【古い日時】が抜粋に
+    # 残り続けることになる。前に置けば、各段で新しい日時だけが付く。
+    parts.append(current_time_note())
     parts.append(f"{BRIEF_INSTRUCTION_HEADER}\n{instructions}")
     return "\n\n".join(parts)
 
