@@ -1,7 +1,0 @@
-{
-  "display_name": "雑談役",
-  "specialty": "雑談・相談・アイデア出し・技術的な質問への回答。ファイルの読み書きやコマンド実行は自分ではできない。",
-  "model": "qwen2.5:14b",
-  "tools": [],
-  "can_handoff_to": ["execute", "review", "plan", "writer", "debug", "test"]
-}

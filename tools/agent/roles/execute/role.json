@@ -1,8 +1,0 @@
-{
-  "display_name": "Execute役",
-  "specialty": "Windows PowerShellでのコマンド実行、ファイルの読み込み・ピンポイント編集などの実作業。",
-  "model": "qwen2.5-coder:14b",
-  "tools": ["execute_command", "edit_file", "write_file", "read_file", "git_diff_summary", "return_to_caller"],
-  "module": "arc_agent",
-  "can_handoff_to": ["review", "plan", "writer", "debug", "test"]
-}

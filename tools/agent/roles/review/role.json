@@ -1,8 +1,0 @@
-{
-  "display_name": "Review役",
-  "specialty": "コードや設定ファイルの中身を読んで確認し、問題点や改善点を指摘する。read_file・execute_command（調査目的のみ）・search_webで調べるが、ファイルの編集・新規作成・削除は一切行わない。",
-  "model": "qwen2.5-coder:14b",
-  "tools": ["read_file", "execute_command", "git_diff_summary", "return_to_caller"],
-  "module": "arc_agent",
-  "can_handoff_to": ["execute", "plan", "writer", "debug", "test"]
-}

@@ -111,6 +111,12 @@
 |-------------------------------------------------------------------------------|-------------|--------------------------|
 | [LLM-homelab](https://github.com/ralius-alpha/LLM-homelab)   | Public      | 連載コンテンツ本体       |
 | **LLM-homelab-bridge**                                                        | **Private** | このリポジトリ・運営司令室 |
+| `llm-homelab-agent`                                                           | Private     | エージェント実装本体（自分用の高度カスタマイズ版） |
+
+[NOTE] エージェントの実装は元々この艦橋の `tools/agent/` にあったが、
+36ファイル中26を占めるまで肥大化したため `llm-homelab-agent` に切り出した
+（履歴ごと移設済み）。艦橋は作戦室に徹し、実装は持たない。
+方針と経緯は [`planning/repository-strategy.md`](./planning/repository-strategy.md) を参照。
 
 ---
 
